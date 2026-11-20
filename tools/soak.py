@@ -54,8 +54,11 @@ def main() -> int:
     threading.Thread(target=reader, daemon=True).start()
 
     def send(c: str):
-        eng.stdin.write(json.dumps({"cmd": c}) + "\n")
-        eng.stdin.flush()
+        try:
+            eng.stdin.write(json.dumps({"cmd": c}) + "\n")
+            eng.stdin.flush()
+        except OSError:
+            pass  # engine gone; reported via poll()
 
     def wait_for(kinds, timeout):
         end = time.time() + timeout

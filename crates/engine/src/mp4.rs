@@ -124,9 +124,9 @@ pub fn write_mp4(path: &Path, video: &VideoTrack, audio: &[AudioTrack]) -> Resul
 
     // --- Header + moov (built twice: size first, then real offsets) --------------------
     let ftyp = build_ftyp();
-    let probe = build_moov(video, &vt, audio, &ats, 0);
+    let probe = build_moov(video, &vt, audio, &ats, 0, false);
     let base = ftyp.len() as u64 + probe.len() as u64 + 16;
-    let moov = build_moov(video, &vt, audio, &ats, base);
+    let moov = build_moov(video, &vt, audio, &ats, base, false);
     debug_assert_eq!(moov.len(), probe.len());
 
     // --- Write ---------------------------------------------------------------------------
@@ -224,7 +224,14 @@ fn to_movie(duration: u64, timescale: u32) -> u32 {
     (duration * MOVIE_TIMESCALE as u64 / timescale as u64) as u32
 }
 
-fn build_moov(video: &VideoTrack, vt: &SampleTable, audio: &[AudioTrack], ats: &[SampleTable], base: u64) -> Vec<u8> {
+fn build_moov(
+    video: &VideoTrack,
+    vt: &SampleTable,
+    audio: &[AudioTrack],
+    ats: &[SampleTable],
+    base: u64,
+    fragmented: bool,
+) -> Vec<u8> {
     let mut w = W(Vec::new());
     let movie_dur = to_movie(vt.total_duration, VIDEO_TIMESCALE);
     w.boxed(b"moov", |w| {
@@ -280,6 +287,19 @@ fn build_moov(video: &VideoTrack, vt: &SampleTable, audio: &[AudioTrack], ats: &
                         });
                     });
                 });
+            });
+        }
+        if fragmented {
+            w.boxed(b"mvex", |w| {
+                for id in 1..=audio.len() as u32 + 1 {
+                    w.full(b"trex", 0, 0, |w| {
+                        w.u32(id);
+                        w.u32(1); // sample description index
+                        w.u32(0);
+                        w.u32(0);
+                        w.u32(0);
+                    });
+                }
             });
         }
     });
@@ -445,10 +465,14 @@ fn sample_tables(w: &mut W, t: &SampleTable, base: u64, video: bool) {
     }
     // one sample per chunk keeps stsc trivial and interleaving exact
     w.full(b"stsc", 0, 0, |w| {
-        w.u32(1);
-        w.u32(1);
-        w.u32(1);
-        w.u32(1);
+        if t.sizes.is_empty() {
+            w.u32(0);
+        } else {
+            w.u32(1);
+            w.u32(1);
+            w.u32(1);
+            w.u32(1);
+        }
     });
     w.full(b"stsz", 0, 0, |w| {
         w.u32(0);
@@ -463,6 +487,166 @@ fn sample_tables(w: &mut W, t: &SampleTable, base: u64, video: bool) {
             w.u64(base + o);
         }
     });
+}
+
+// ---------------------------------------------------------------------------------------
+// Fragmented MP4 for manual recordings: header once, then one moof+mdat per GOP. The file
+// is playable up to the last complete fragment, so a crash or power cut loses ~1 s.
+
+const SAMPLE_SYNC: u32 = 0x0200_0000; // sample_depends_on = 2 (independent)
+const SAMPLE_NON_SYNC: u32 = 0x0101_0000; // depends on others, is_non_sync_sample
+
+pub struct FragmentedWriter {
+    file: BufWriter<File>,
+    seq: u32,
+    origin: i64,
+    fps: u32,
+    audio_samples: Vec<u64>,
+    bytes: u64,
+    video_frames: usize,
+    video_end: u64,
+}
+
+fn empty_table() -> SampleTable {
+    SampleTable {
+        sizes: vec![],
+        offsets: vec![],
+        durations: vec![],
+        keys: vec![],
+        total_duration: 0,
+    }
+}
+
+impl FragmentedWriter {
+    /// `video.packets` must start with the keyframe the recording begins at (its pts is t = 0).
+    pub fn create(path: &Path, video: &VideoTrack, audio: &[AudioTrack]) -> Result<Self> {
+        let first = video.packets.first().context("recording needs a first keyframe")?;
+        if video.sps.len() < 4 || video.pps.is_empty() {
+            bail!("missing H.264 parameter sets");
+        }
+        let f = File::create(path).with_context(|| format!("create {}", path.display()))?;
+        let mut file = BufWriter::with_capacity(1 << 20, f);
+        let mut ftyp = W(Vec::new());
+        ftyp.boxed(b"ftyp", |w| {
+            w.bytes(b"isom");
+            w.u32(0x200);
+            for b in [b"isom", b"iso6", b"avc1", b"mp41"] {
+                w.bytes(b);
+            }
+        });
+        let ats: Vec<SampleTable> = audio.iter().map(|_| empty_table()).collect();
+        let moov = build_moov(video, &empty_table(), audio, &ats, 0, true);
+        file.write_all(&ftyp.0)?;
+        file.write_all(&moov)?;
+        file.flush()?;
+        Ok(Self {
+            file,
+            seq: 0,
+            origin: first.pts,
+            fps: video.fps.max(1),
+            audio_samples: vec![0; audio.len()],
+            bytes: (ftyp.0.len() + moov.len()) as u64,
+            video_frames: 0,
+            video_end: 0,
+        })
+    }
+
+    fn vts(&self, pts: i64) -> u64 {
+        (((pts - self.origin).max(0) as i128 * VIDEO_TIMESCALE as i128 + 5_000_000) / 10_000_000) as u64
+    }
+
+    /// Writes one fragment. `next_video_pts` (the first frame of the next fragment) sets the
+    /// last frame's duration; `None` = end of recording.
+    pub fn write_fragment(&mut self, video: &[Packet], next_video_pts: Option<i64>, audio: &[&[Packet]]) -> Result<()> {
+        if video.is_empty() && audio.iter().all(|a| a.is_empty()) {
+            return Ok(());
+        }
+        self.seq += 1;
+        let nominal = (VIDEO_TIMESCALE / self.fps) as u64;
+        let video_base = video.first().map(|p| self.vts(p.pts)).unwrap_or(self.video_end);
+        // (duration, size, flags) per sample
+        let mut vs: Vec<(u32, u32, u32)> = Vec::with_capacity(video.len());
+        for (i, p) in video.iter().enumerate() {
+            let start = self.vts(p.pts);
+            let end = match video.get(i + 1).map(|n| n.pts).or(next_video_pts) {
+                Some(n) => self.vts(n),
+                None => start + nominal,
+            };
+            let flags = if p.key { SAMPLE_SYNC } else { SAMPLE_NON_SYNC };
+            vs.push((end.saturating_sub(start).max(1) as u32, p.data.len() as u32, flags));
+            self.video_end = end;
+        }
+        let mut tracks: Vec<(u32, u64, Vec<(u32, u32, u32)>)> = vec![(1, video_base, vs)];
+        for (i, a) in audio.iter().enumerate() {
+            let samples = a
+                .iter()
+                .map(|p| (AAC_FRAME, p.data.len() as u32, SAMPLE_SYNC))
+                .collect();
+            tracks.push((i as u32 + 2, self.audio_samples[i], samples));
+        }
+        let data_len: Vec<u64> = tracks
+            .iter()
+            .map(|(_, _, s)| s.iter().map(|x| x.1 as u64).sum())
+            .collect();
+        let seq = self.seq;
+        let build = |moof_len: u64| -> Vec<u8> {
+            let mut w = W(Vec::new());
+            w.boxed(b"moof", |w| {
+                w.full(b"mfhd", 0, 0, |w| w.u32(seq));
+                let mut offset = moof_len + 8;
+                for ((id, base, samples), len) in tracks.iter().zip(&data_len) {
+                    if samples.is_empty() {
+                        continue;
+                    }
+                    w.boxed(b"traf", |w| {
+                        w.full(b"tfhd", 0, 0x02_0000, |w| w.u32(*id)); // default-base-is-moof
+                        w.full(b"tfdt", 1, 0, |w| w.u64(*base));
+                        w.full(b"trun", 0, 0x0001 | 0x0100 | 0x0200 | 0x0400, |w| {
+                            w.u32(samples.len() as u32);
+                            w.u32(offset as u32);
+                            for (d, sz, fl) in samples {
+                                w.u32(*d);
+                                w.u32(*sz);
+                                w.u32(*fl);
+                            }
+                        });
+                    });
+                    offset += len;
+                }
+            });
+            w.0
+        };
+        let moof_len = build(0).len() as u64;
+        let moof = build(moof_len);
+        let payload: u64 = data_len.iter().sum();
+        self.file.write_all(&moof)?;
+        self.file.write_all(&((payload + 8) as u32).to_be_bytes())?;
+        self.file.write_all(b"mdat")?;
+        for p in video {
+            self.file.write_all(&p.data)?;
+        }
+        for (i, a) in audio.iter().enumerate() {
+            for p in a.iter() {
+                self.file.write_all(&p.data)?;
+            }
+            self.audio_samples[i] += a.len() as u64 * AAC_FRAME as u64;
+        }
+        self.file.flush()?;
+        self.bytes += moof_len + 8 + payload;
+        self.video_frames += video.len();
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<MuxStats> {
+        self.file.flush()?;
+        let f = self.file.into_inner().map_err(|e| e.into_error())?;
+        f.sync_all()?;
+        Ok(MuxStats {
+            duration_hns: self.video_end as i64 * 10_000_000 / VIDEO_TIMESCALE as i64,
+            bytes: self.bytes,
+            video_frames: self.video_frames,
+        })
+    }
 }
 
 #[cfg(test)]

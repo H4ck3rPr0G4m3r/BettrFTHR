@@ -13,6 +13,7 @@ mod h264;
 mod hotkey;
 mod mp4;
 mod pipeline;
+mod recording;
 mod ring;
 
 use anyhow::{Context, Result};
@@ -31,6 +32,7 @@ struct Args {
     video: VideoConfig,
     audio: AudioConfig,
     save_key: String,
+    record_key: String,
     list_encoders: bool,
     list_audio: bool,
     selftest_aac: Option<PathBuf>,
@@ -51,6 +53,7 @@ fn parse_args() -> Result<Args> {
             replay_seconds: 30,
         },
         save_key: "F9".into(),
+        record_key: "F10".into(),
         list_encoders: false,
         list_audio: false,
         selftest_aac: None,
@@ -66,6 +69,7 @@ fn parse_args() -> Result<Args> {
             "--height" => a.video.target_height = val()?.parse()?,
             "--seconds" => a.video.replay_seconds = val()?.parse()?,
             "--save-key" => a.save_key = val()?,
+            "--record-key" => a.record_key = val()?,
             "--no-cursor" => a.video.cursor = false,
             // Repeatable: --output default --input "Shure" --input "Line 1@0.7"
             "--output" => a.audio.sources.push(SourceSpec::parse(SourceKind::Output, &val()?)?),
@@ -96,6 +100,9 @@ fn emit(v: serde_json::Value) {
 
 enum Command {
     Save,
+    RecordStart,
+    RecordStop,
+    RecordToggle,
     Status,
     Quit,
 }
@@ -113,6 +120,9 @@ fn parse_command(line: &str) -> Option<Command> {
     };
     match name.as_str() {
         "save" => Some(Command::Save),
+        "record_start" => Some(Command::RecordStart),
+        "record_stop" => Some(Command::RecordStop),
+        "record_toggle" => Some(Command::RecordToggle),
         "status" => Some(Command::Status),
         "quit" | "exit" => Some(Command::Quit),
         _ => None,
@@ -132,6 +142,40 @@ fn clip_path(dir: &Path, label: &str) -> PathBuf {
         n += 1;
     }
     p
+}
+
+fn start_recording(video: &VideoPipeline, audio: Option<&AudioEngine>, out_dir: &Path) -> Option<recording::Recorder> {
+    let src = recording::RecordingSource {
+        video: video.shared.clone(),
+        width: video.width,
+        height: video.height,
+        fps: video.fps,
+        audio: audio.map(|a| a.shared.clone()),
+    };
+    match recording::Recorder::start(src, clip_path(out_dir, "Recording")) {
+        Ok(r) => {
+            emit(json!({"event": "recording_started", "path": r.path}));
+            Some(r)
+        }
+        Err(e) => {
+            emit(json!({"event": "error", "message": format!("recording failed to start: {e:#}")}));
+            None
+        }
+    }
+}
+
+fn finish_recording(r: recording::Recorder, reason: &str) {
+    let path = r.path.clone();
+    match r.stop() {
+        Ok(stats) => emit(json!({
+            "event": "recording_stopped",
+            "path": path,
+            "reason": reason,
+            "seconds": stats.duration_hns as f64 / 1e7,
+            "bytes": stats.bytes,
+        })),
+        Err(e) => emit(json!({"event": "error", "path": path, "message": format!("recording failed: {e:#}")})),
+    }
 }
 
 fn save_clip(video: &VideoPipeline, audio: Option<&AudioEngine>, seconds: u32, out_dir: &Path) {
@@ -284,13 +328,13 @@ fn main() -> Result<()> {
     {
         let (hk_tx, hk_rx) = crossbeam_channel::unbounded::<i32>();
         let save = hotkey::Hotkey::parse(&args.save_key).with_context(|| format!("bad hotkey {}", args.save_key))?;
-        hotkey::spawn(vec![(1, save)], hk_tx);
+        let record =
+            hotkey::Hotkey::parse(&args.record_key).with_context(|| format!("bad hotkey {}", args.record_key))?;
+        hotkey::spawn(vec![(1, save), (2, record)], hk_tx);
         let tx = cmd_tx.clone();
         std::thread::spawn(move || {
             for id in hk_rx {
-                if id == 1 {
-                    let _ = tx.send(Command::Save);
-                }
+                let _ = tx.send(if id == 1 { Command::Save } else { Command::RecordToggle });
             }
         });
     }
@@ -299,9 +343,25 @@ fn main() -> Result<()> {
     let mut last_encoded = 0u64;
     let mut last_progress = std::time::Instant::now();
     let mut restarts = 0u32;
+    let mut recorder: Option<recording::Recorder> = None;
     loop {
-        match cmd_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+        let cmd = cmd_rx.recv_timeout(std::time::Duration::from_secs(1));
+        let cmd = match cmd {
+            Ok(Command::RecordToggle) if recorder.is_some() => Ok(Command::RecordStop),
+            Ok(Command::RecordToggle) => Ok(Command::RecordStart),
+            other => other,
+        };
+        match cmd {
             Ok(Command::Save) => save_clip(&video, audio.as_ref(), args.video.replay_seconds, &args.out_dir),
+            Ok(Command::RecordStart) if recorder.is_none() => {
+                recorder = start_recording(&video, audio.as_ref(), &args.out_dir);
+            }
+            Ok(Command::RecordStop) => {
+                if let Some(r) = recorder.take() {
+                    finish_recording(r, "stopped");
+                }
+            }
+            Ok(Command::RecordStart | Command::RecordToggle) => {}
             Ok(Command::Status) => {
                 let s = &video.shared.stats;
                 let ring = video.shared.ring.lock();
@@ -324,10 +384,14 @@ fn main() -> Result<()> {
                     "buffered_seconds": ring.span() as f64 / 1e7,
                     "buffered_mb": ring.bytes() as f64 / 1048576.0,
                     "audio_sources": sources,
+                    "recording": recorder.as_ref().map(|r| &r.path),
                 }));
             }
             Ok(Command::Quit) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+        }
+        if recorder.as_ref().is_some_and(|r| r.is_finished()) {
+            finish_recording(recorder.take().unwrap(), "failed");
         }
         let encoded = video.shared.stats.encoded.load(Ordering::Relaxed);
         let captured = video.shared.stats.captured.load(Ordering::Relaxed);
@@ -345,6 +409,11 @@ fn main() -> Result<()> {
             emit(
                 json!({"event": "restarting", "reason": if stalled { "encoder stalled" } else if video.failed() { "pipeline error" } else { "display changed" }}),
             );
+            // A new encoder means new parameter sets: close the recording, continue in a new file.
+            let was_recording = recorder
+                .take()
+                .map(|r| finish_recording(r, "pipeline restarted"))
+                .is_some();
             video.stop();
             match VideoPipeline::start(None, &args.video) {
                 Ok(v) => {
@@ -352,6 +421,10 @@ fn main() -> Result<()> {
                     last_encoded = 0;
                     last_progress = std::time::Instant::now();
                     emit(json!({"event": "restarted"}));
+                    if was_recording {
+                        std::thread::sleep(std::time::Duration::from_millis(1500)); // first keyframe
+                        recorder = start_recording(&video, audio.as_ref(), &args.out_dir);
+                    }
                 }
                 Err(e) => {
                     emit(json!({"event": "error", "message": format!("restart failed: {e:#}")}));
@@ -359,6 +432,9 @@ fn main() -> Result<()> {
                 }
             }
         }
+    }
+    if let Some(r) = recorder.take() {
+        finish_recording(r, "engine stopping");
     }
     video.stop();
     if let Some(a) = &mut audio {
