@@ -83,9 +83,19 @@ impl VideoEncoder {
         })
     }
 
+    /// Waits for the encoder thread to drain and exit. A hung driver can block the MFT
+    /// forever, so after `timeout` the thread is abandoned (leaked) instead of hanging the
+    /// engine; the pipeline is rebuilt with a fresh encoder.
     pub fn join(&mut self) {
-        if let Some(t) = self.thread.take() {
+        let Some(t) = self.thread.take() else { return };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !t.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if t.is_finished() {
             let _ = t.join();
+        } else {
+            tracing::error!("video encoder did not stop within 2 s; abandoning it");
         }
     }
 }

@@ -37,7 +37,7 @@ pub struct MonitorCapture {
     session: GraphicsCaptureSession,
     pool: Direct3D11CaptureFramePool,
     pub latest: Arc<Mutex<Sendable<LatestFrame>>>,
-    /// Set when the source size changes; the pipeline must be rebuilt.
+    /// Set when the source size changes or the source disappears; the pipeline must be rebuilt.
     pub size_changed: Arc<AtomicBool>,
     pub width: u32,
     pub height: u32,
@@ -133,6 +133,15 @@ impl MonitorCapture {
             },
         ))?;
 
+        // Monitor unplugged / display topology changed: the item dies; rebuild the pipeline.
+        let closed_cb = size_changed.clone();
+        item.Closed(&TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(
+            move |_, _| {
+                tracing::warn!("capture item closed (display disconnected?)");
+                closed_cb.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        ))?;
         let session = pool.CreateCaptureSession(&item)?;
         let _ = session.SetIsCursorCaptureEnabled(cursor);
         // Windows 11+: no yellow capture border. Older builds reject this; harmless.

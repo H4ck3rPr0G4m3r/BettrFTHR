@@ -295,6 +295,10 @@ fn main() -> Result<()> {
         });
     }
 
+    // Encoder watchdog: frames are being captured but nothing comes out of the encoder.
+    let mut last_encoded = 0u64;
+    let mut last_progress = std::time::Instant::now();
+    let mut restarts = 0u32;
     loop {
         match cmd_rx.recv_timeout(std::time::Duration::from_secs(1)) {
             Ok(Command::Save) => save_clip(&video, audio.as_ref(), args.video.replay_seconds, &args.out_dir),
@@ -325,12 +329,28 @@ fn main() -> Result<()> {
             Ok(Command::Quit) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
         }
-        if video.failed() || video.source_changed() {
-            tracing::warn!("video pipeline needs a restart");
+        let encoded = video.shared.stats.encoded.load(Ordering::Relaxed);
+        let captured = video.shared.stats.captured.load(Ordering::Relaxed);
+        if encoded != last_encoded || captured == 0 {
+            last_encoded = encoded;
+            last_progress = std::time::Instant::now();
+        }
+        let stalled = last_progress.elapsed() > std::time::Duration::from_secs(3);
+        if stalled {
+            tracing::error!(encoded, captured, "video encoder stalled");
+        }
+        if video.failed() || video.source_changed() || stalled {
+            restarts += 1;
+            tracing::warn!(restarts, "video pipeline needs a restart");
+            emit(
+                json!({"event": "restarting", "reason": if stalled { "encoder stalled" } else if video.failed() { "pipeline error" } else { "display changed" }}),
+            );
             video.stop();
             match VideoPipeline::start(None, &args.video) {
                 Ok(v) => {
                     video = v;
+                    last_encoded = 0;
+                    last_progress = std::time::Instant::now();
                     emit(json!({"event": "restarted"}));
                 }
                 Err(e) => {
