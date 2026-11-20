@@ -61,10 +61,7 @@ pub fn spawn(bindings: Vec<(i32, Hotkey)>, tx: Sender<i32>) -> std::thread::Join
             for (id, hk) in &bindings {
                 let mods = HOT_KEY_MODIFIERS(hk.modifiers | MOD_NOREPEAT.0);
                 if let Err(e) = unsafe { RegisterHotKey(None, *id, mods, hk.vk) } {
-                    tracing::error!(
-                        ?hk,
-                        "hotkey registration failed (in use by another app?): {e}"
-                    );
+                    tracing::error!(?hk, "hotkey registration failed (in use by another app?): {e}");
                 }
             }
             let mut msg = MSG::default();
@@ -83,13 +80,7 @@ mod tests {
 
     #[test]
     fn parses_common_hotkeys() {
-        assert_eq!(
-            Hotkey::parse("F9"),
-            Some(Hotkey {
-                modifiers: 0,
-                vk: 0x78
-            })
-        );
+        assert_eq!(Hotkey::parse("F9"), Some(Hotkey { modifiers: 0, vk: 0x78 }));
         assert_eq!(
             Hotkey::parse("alt+f10"),
             Some(Hotkey {

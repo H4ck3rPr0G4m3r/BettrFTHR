@@ -3,6 +3,7 @@
 //! Protocol: JSON lines. Commands on stdin (`{"cmd":"save"}` or just `save`), events on
 //! stdout. Logs go to stderr so stdout stays machine-readable.
 
+mod audio;
 mod capture;
 mod clock;
 mod convert;
@@ -15,6 +16,7 @@ mod pipeline;
 mod ring;
 
 use anyhow::{Context, Result};
+use audio::{AudioConfig, AudioEngine};
 use pipeline::{VideoConfig, VideoPipeline};
 use serde_json::json;
 use std::io::{BufRead, Write};
@@ -27,8 +29,10 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 struct Args {
     out_dir: PathBuf,
     video: VideoConfig,
+    audio: AudioConfig,
     save_key: String,
     list_encoders: bool,
+    selftest_aac: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -41,8 +45,15 @@ fn parse_args() -> Result<Args> {
             cursor: true,
             replay_seconds: 30,
         },
+        audio: AudioConfig {
+            mic: true,
+            game_gain: 1.0,
+            mic_gain: 1.0,
+            replay_seconds: 30,
+        },
         save_key: "F9".into(),
         list_encoders: false,
+        selftest_aac: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -55,11 +66,16 @@ fn parse_args() -> Result<Args> {
             "--seconds" => a.video.replay_seconds = val()?.parse()?,
             "--save-key" => a.save_key = val()?,
             "--no-cursor" => a.video.cursor = false,
+            "--no-mic" => a.audio.mic = false,
+            "--mic-gain" => a.audio.mic_gain = val()?.parse()?,
+            "--game-gain" => a.audio.game_gain = val()?.parse()?,
             "--list-encoders" => a.list_encoders = true,
+            "--selftest-aac" => a.selftest_aac = Some(PathBuf::from(val()?)),
             "--cli" => {}
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
+    a.audio.replay_seconds = a.video.replay_seconds;
     Ok(a)
 }
 
@@ -109,16 +125,47 @@ fn clip_path(dir: &Path, label: &str) -> PathBuf {
     p
 }
 
-fn save_clip(video: &VideoPipeline, seconds: u32, out_dir: &Path) {
+fn save_clip(video: &VideoPipeline, audio: Option<&AudioEngine>, seconds: u32, out_dir: &Path) {
     let started = std::time::Instant::now();
     let Some(snap) = video.snapshot(seconds) else {
         emit(json!({"event": "error", "message": "nothing buffered yet"}));
         return;
     };
+    let start = snap.packets[0].pts;
+    let end = snap.packets.last().map(|p| p.pts + p.duration).unwrap_or(start);
+    let audio = audio.map(|a| a.shared.clone());
     let dir = out_dir.to_path_buf();
     // Muxing is pure CPU + disk; never block the command loop on it.
     std::thread::spawn(move || {
+        // Audio runs ~100 ms behind real time (WASAPI latency + padding lag). Wait until it
+        // has caught up with the last video frame, bounded so a dead source can't stall saves.
+        if let Some(a) = &audio {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+            while a.encoded_until() < end && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let sound = audio.map(|a| a.snapshot(start, end));
         let path = clip_path(&dir, "Clip");
+        let mut tracks = Vec::new();
+        if let Some(s) = &sound {
+            // Track order matters: players and Discord play the first (enabled) one.
+            for (name, packets, enabled) in [("Mix", &s.mix, true), ("Game", &s.game, false), ("Mic", &s.mic, false)] {
+                if !packets.is_empty() {
+                    tracks.push(mp4::AudioTrack {
+                        name,
+                        sample_rate: audio::RATE,
+                        channels: audio::CHANNELS,
+                        enabled,
+                        packets,
+                    });
+                }
+            }
+        }
+        let audio_offset_ms = sound
+            .as_ref()
+            .and_then(|s| s.mix.first())
+            .map(|p| (p.pts - start) as f64 / 1e4);
         let res = std::fs::create_dir_all(&dir)
             .map_err(anyhow::Error::from)
             .and_then(|_| {
@@ -132,18 +179,26 @@ fn save_clip(video: &VideoPipeline, seconds: u32, out_dir: &Path) {
                         pps: &snap.pps,
                         packets: &snap.packets,
                     },
-                    &[],
+                    &tracks,
                 )
             });
         match res {
             Ok(stats) => {
-                tracing::info!(path = %path.display(), secs = stats.duration_hns as f64 / 1e7, ms = started.elapsed().as_millis() as u64, "clip saved");
+                tracing::info!(
+                    path = %path.display(),
+                    secs = stats.duration_hns as f64 / 1e7,
+                    audio_tracks = tracks.len(),
+                    ?audio_offset_ms,
+                    ms = started.elapsed().as_millis() as u64,
+                    "clip saved"
+                );
                 emit(json!({
                     "event": "clip_saved",
                     "path": path,
                     "seconds": stats.duration_hns as f64 / 1e7,
                     "bytes": stats.bytes,
                     "frames": stats.video_frames,
+                    "audio_tracks": tracks.len(),
                 }));
             }
             Err(e) => {
@@ -157,9 +212,7 @@ fn save_clip(video: &VideoPipeline, seconds: u32, out_dir: &Path) {
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let args = parse_args()?;
     let _com = encoder::ComScope::init();
@@ -168,15 +221,25 @@ fn main() -> Result<()> {
     if args.list_encoders {
         let gpu = d3d::create_for_monitor(d3d::primary_monitor())?;
         println!("capture adapter: {}", gpu.adapter_name);
-        println!(
-            "encoders on it:  {:?}",
-            encoder::list_hardware_h264(Some(gpu.luid))
-        );
+        println!("encoders on it:  {:?}", encoder::list_hardware_h264(Some(gpu.luid)));
         println!("all encoders:    {:?}", encoder::list_hardware_h264(None));
+        return Ok(());
+    }
+    if let Some(path) = &args.selftest_aac {
+        audio::selftest_aac(path)?;
+        println!("wrote {} (clicks at 0.5 s and 1.0 s)", path.display());
         return Ok(());
     }
 
     let mut video = VideoPipeline::start(None, &args.video)?;
+    let mut audio = match AudioEngine::start(args.audio.clone()) {
+        Ok(a) => Some(a),
+        Err(e) => {
+            tracing::error!("audio disabled: {e:#}");
+            emit(json!({"event": "warning", "message": format!("audio disabled: {e:#}")}));
+            None
+        }
+    };
     emit(json!({
         "event": "ready",
         "adapter": video.gpu.adapter_name,
@@ -184,10 +247,10 @@ fn main() -> Result<()> {
         "width": video.width,
         "height": video.height,
         "fps": video.fps,
+        "audio": audio.is_some(),
     }));
 
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<Command>();
-    // stdin commands
     {
         let tx = cmd_tx.clone();
         std::thread::spawn(move || {
@@ -200,11 +263,9 @@ fn main() -> Result<()> {
             let _ = tx.send(Command::Quit); // parent went away
         });
     }
-    // hotkeys
     {
         let (hk_tx, hk_rx) = crossbeam_channel::unbounded::<i32>();
-        let save = hotkey::Hotkey::parse(&args.save_key)
-            .with_context(|| format!("bad hotkey {}", args.save_key))?;
+        let save = hotkey::Hotkey::parse(&args.save_key).with_context(|| format!("bad hotkey {}", args.save_key))?;
         hotkey::spawn(vec![(1, save)], hk_tx);
         let tx = cmd_tx.clone();
         std::thread::spawn(move || {
@@ -218,10 +279,14 @@ fn main() -> Result<()> {
 
     loop {
         match cmd_rx.recv_timeout(std::time::Duration::from_secs(1)) {
-            Ok(Command::Save) => save_clip(&video, args.video.replay_seconds, &args.out_dir),
+            Ok(Command::Save) => save_clip(&video, audio.as_ref(), args.video.replay_seconds, &args.out_dir),
             Ok(Command::Status) => {
                 let s = &video.shared.stats;
                 let ring = video.shared.ring.lock();
+                let (game_dev, mic_dev) = audio
+                    .as_ref()
+                    .map(|a| (a.shared.game_device.lock().clone(), a.shared.mic_device.lock().clone()))
+                    .unwrap_or_default();
                 emit(json!({
                     "event": "status",
                     "ticks": s.ticks.load(Ordering::Relaxed),
@@ -230,6 +295,8 @@ fn main() -> Result<()> {
                     "captured": s.captured.load(Ordering::Relaxed),
                     "buffered_seconds": ring.span() as f64 / 1e7,
                     "buffered_mb": ring.bytes() as f64 / 1048576.0,
+                    "game_device": game_dev,
+                    "mic_device": mic_dev,
                 }));
             }
             Ok(Command::Quit) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -251,6 +318,9 @@ fn main() -> Result<()> {
         }
     }
     video.stop();
+    if let Some(a) = &mut audio {
+        a.stop();
+    }
     emit(json!({"event": "stopped"}));
     Ok(())
 }

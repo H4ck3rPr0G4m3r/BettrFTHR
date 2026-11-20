@@ -80,14 +80,9 @@ mod tests {
 
     #[test]
     fn splits_mixed_start_codes() {
-        let data = [
-            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 9, 9,
-        ];
+        let data = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 9, 9];
         let nals = split_annexb(&data);
-        assert_eq!(
-            nals,
-            vec![&[0x67, 1, 2][..], &[0x68, 3][..], &[0x65, 9, 9][..]]
-        );
+        assert_eq!(nals, vec![&[0x67, 1, 2][..], &[0x68, 3][..], &[0x65, 9, 9][..]]);
     }
 
     #[test]

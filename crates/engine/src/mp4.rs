@@ -111,11 +111,7 @@ pub fn write_mp4(path: &Path, video: &VideoTrack, audio: &[AudioTrack]) -> Resul
     order.sort_by_key(|&(t, i, pts)| (pts, t, i));
     let mut cursor = 0u64;
     for &(t, i, _) in &order {
-        let len = if t == 0 {
-            vt.sizes[i]
-        } else {
-            ats[t - 1].sizes[i]
-        } as u64;
+        let len = if t == 0 { vt.sizes[i] } else { ats[t - 1].sizes[i] } as u64;
         if t == 0 {
             vt.offsets.push(cursor);
         } else {
@@ -228,13 +224,7 @@ fn to_movie(duration: u64, timescale: u32) -> u32 {
     (duration * MOVIE_TIMESCALE as u64 / timescale as u64) as u32
 }
 
-fn build_moov(
-    video: &VideoTrack,
-    vt: &SampleTable,
-    audio: &[AudioTrack],
-    ats: &[SampleTable],
-    base: u64,
-) -> Vec<u8> {
+fn build_moov(video: &VideoTrack, vt: &SampleTable, audio: &[AudioTrack], ats: &[SampleTable], base: u64) -> Vec<u8> {
     let mut w = W(Vec::new());
     let movie_dur = to_movie(vt.total_duration, VIDEO_TIMESCALE);
     w.boxed(b"moov", |w| {
@@ -297,16 +287,7 @@ fn build_moov(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn track_header(
-    w: &mut W,
-    id: u32,
-    flags: u32,
-    duration: u32,
-    alt_group: u16,
-    audio: bool,
-    width: u32,
-    height: u32,
-) {
+fn track_header(w: &mut W, id: u32, flags: u32, duration: u32, alt_group: u16, audio: bool, width: u32, height: u32) {
     w.full(b"tkhd", 0, flags, |w| {
         w.u32(0);
         w.u32(0);

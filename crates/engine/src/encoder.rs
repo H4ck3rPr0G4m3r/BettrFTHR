@@ -11,9 +11,7 @@ use std::thread::JoinHandle;
 use windows::Win32::Foundation::LUID;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Media::MediaFoundation::*;
-use windows::Win32::System::Com::{
-    COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
-};
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize};
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::{GUID, Interface, PWSTR};
 
@@ -61,8 +59,7 @@ impl VideoEncoder {
             .name("video-encoder".into())
             .spawn(move || {
                 let _com = ComScope::init();
-                let mut session = match EncoderSession::new(device.get(), luid, &adapter_name, cfg)
-                {
+                let mut session = match EncoderSession::new(device.get(), luid, &adapter_name, cfg) {
                     Ok(s) => {
                         let _ = init_tx.send(Ok(s.name.clone()));
                         s
@@ -129,15 +126,9 @@ fn set_codec_value(codec: &ICodecAPI, api: &GUID, value: VARIANT, label: &str) {
 }
 
 impl EncoderSession {
-    fn new(
-        device: &ID3D11Device,
-        luid: LUID,
-        adapter_name: &str,
-        cfg: EncoderConfig,
-    ) -> Result<Self> {
+    fn new(device: &ID3D11Device, luid: LUID, adapter_name: &str, cfg: EncoderConfig) -> Result<Self> {
         let (activate, name) = find_hardware_h264(luid, adapter_name)?;
-        let transform: IMFTransform =
-            unsafe { activate.ActivateObject() }.context("activate encoder MFT")?;
+        let transform: IMFTransform = unsafe { activate.ActivateObject() }.context("activate encoder MFT")?;
         let attrs = unsafe { transform.GetAttributes() }?;
         let is_async = unsafe { attrs.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) != 0;
         if !is_async {
@@ -167,24 +158,14 @@ impl EncoderSession {
                 VARIANT::from(cfg.bitrate_kbps * 1000),
                 "bitrate",
             );
-            set_codec_value(
-                &codec,
-                &CODECAPI_AVEncMPVGOPSize,
-                VARIANT::from(cfg.gop_frames),
-                "gop",
-            );
+            set_codec_value(&codec, &CODECAPI_AVEncMPVGOPSize, VARIANT::from(cfg.gop_frames), "gop");
             set_codec_value(
                 &codec,
                 &CODECAPI_AVEncMPVDefaultBPictureCount,
                 VARIANT::from(0u32),
                 "b-frames",
             );
-            set_codec_value(
-                &codec,
-                &CODECAPI_AVLowLatencyMode,
-                VARIANT::from(true),
-                "low latency",
-            );
+            set_codec_value(&codec, &CODECAPI_AVLowLatencyMode, VARIANT::from(true), "low latency");
         }
 
         let size = ((cfg.width as u64) << 32) | cfg.height as u64;
@@ -200,9 +181,7 @@ impl EncoderSession {
             out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
             set_color(&out)?;
-            transform
-                .SetOutputType(0, &out, 0)
-                .context("SetOutputType(H.264)")?;
+            transform.SetOutputType(0, &out, 0).context("SetOutputType(H.264)")?;
 
             let inp = MFCreateMediaType()?;
             inp.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -212,9 +191,7 @@ impl EncoderSession {
             inp.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)?;
             inp.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             set_color(&inp)?;
-            transform
-                .SetInputType(0, &inp, 0)
-                .context("SetInputType(NV12)")?;
+            transform.SetInputType(0, &inp, 0).context("SetInputType(NV12)")?;
 
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
@@ -229,18 +206,11 @@ impl EncoderSession {
         })
     }
 
-    fn run(
-        &mut self,
-        jobs: &Receiver<EncodeJob>,
-        mut on_frame: impl FnMut(EncodedFrame),
-    ) -> Result<()> {
+    fn run(&mut self, jobs: &Receiver<EncodeJob>, mut on_frame: impl FnMut(EncodedFrame)) -> Result<()> {
         let mut draining = false;
         loop {
-            let event = unsafe {
-                self.events
-                    .GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0))
-            }
-            .context("encoder GetEvent")?;
+            let event = unsafe { self.events.GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0)) }
+                .context("encoder GetEvent")?;
             let kind = unsafe { event.GetType() }?;
             let status = unsafe { event.GetStatus() }?;
             if status.is_err() {
@@ -255,10 +225,8 @@ impl EncoderSession {
                     Err(_) => {
                         draining = true;
                         unsafe {
-                            self.transform
-                                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)?;
-                            self.transform
-                                .ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)?;
+                            self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)?;
+                            self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)?;
                         }
                     }
                 }
@@ -275,8 +243,7 @@ impl EncoderSession {
 
     fn push(&mut self, job: EncodeJob) -> Result<()> {
         unsafe {
-            let buffer =
-                MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &job.texture.0, 0, false)?;
+            let buffer = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &job.texture.0, 0, false)?;
             let sample = MFCreateSample()?;
             sample.AddBuffer(&buffer)?;
             sample.SetSampleTime(job.pts)?;
@@ -290,10 +257,8 @@ impl EncoderSession {
 
     fn pull(&mut self) -> Result<Option<EncodedFrame>> {
         let info = unsafe { self.transform.GetOutputStreamInfo(0) }?;
-        let provides = info.dwFlags
-            & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0)
-                as u32
-            != 0;
+        let provides =
+            info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0) as u32 != 0;
         let own = if provides {
             None
         } else {
@@ -350,9 +315,7 @@ impl EncoderSession {
 impl Drop for EncoderSession {
     fn drop(&mut self) {
         unsafe {
-            let _ = self
-                .transform
-                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
             let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
             if let Ok(shutdown) = self.transform.cast::<IMFShutdown>() {
                 let _ = shutdown.Shutdown();
@@ -440,8 +403,7 @@ fn enum_hardware_h264(luid: Option<LUID>) -> Result<Vec<(IMFActivate, String)>> 
         let slots = unsafe { std::slice::from_raw_parts_mut(ptr, count as usize) };
         for slot in slots.iter_mut() {
             if let Some(a) = slot.take() {
-                let name = attr_string(&a, &MFT_FRIENDLY_NAME_Attribute)
-                    .unwrap_or_else(|| "unknown encoder".into());
+                let name = attr_string(&a, &MFT_FRIENDLY_NAME_Attribute).unwrap_or_else(|| "unknown encoder".into());
                 list.push((a, name));
             }
         }
@@ -467,10 +429,7 @@ fn find_hardware_h264(luid: LUID, adapter_name: &str) -> Result<(IMFActivate, St
     }
     let mut list = enum_hardware_h264(None)?;
     let names: Vec<_> = list.iter().map(|(_, n)| n.clone()).collect();
-    match list
-        .iter()
-        .position(|(_, n)| vendor_matches(n, adapter_name))
-    {
+    match list.iter().position(|(_, n)| vendor_matches(n, adapter_name)) {
         Some(i) => Ok(list.swap_remove(i)),
         None => bail!("no hardware H.264 encoder for {adapter_name} (found: {names:?})"),
     }
@@ -482,14 +441,8 @@ mod tests {
 
     #[test]
     fn vendor_matching() {
-        assert!(vendor_matches(
-            "NVIDIA H.264 Encoder MFT",
-            "NVIDIA GeForce RTX 3060 Ti"
-        ));
+        assert!(vendor_matches("NVIDIA H.264 Encoder MFT", "NVIDIA GeForce RTX 3060 Ti"));
         assert!(vendor_matches("AMDh264Encoder", "AMD Radeon(TM) Graphics"));
-        assert!(!vendor_matches(
-            "AMDh264Encoder",
-            "NVIDIA GeForce RTX 3060 Ti"
-        ));
+        assert!(!vendor_matches("AMDh264Encoder", "NVIDIA GeForce RTX 3060 Ti"));
     }
 }

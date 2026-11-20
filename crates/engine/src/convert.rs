@@ -25,10 +25,7 @@ pub fn create_nv12_texture(gpu: &Gpu, width: u32, height: u32) -> Result<ID3D11T
         MipLevels: 1,
         ArraySize: 1,
         Format: DXGI_FORMAT_NV12,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_VIDEO_ENCODER.0) as u32,
         CPUAccessFlags: 0,
@@ -38,8 +35,7 @@ pub fn create_nv12_texture(gpu: &Gpu, width: u32, height: u32) -> Result<ID3D11T
     if unsafe { gpu.device.CreateTexture2D(&desc, None, Some(&mut tex)) }.is_err() {
         // Some drivers reject VIDEO_ENCODER together with RENDER_TARGET.
         desc.BindFlags = D3D11_BIND_RENDER_TARGET.0 as u32;
-        unsafe { gpu.device.CreateTexture2D(&desc, None, Some(&mut tex)) }
-            .context("CreateTexture2D(NV12)")?;
+        unsafe { gpu.device.CreateTexture2D(&desc, None, Some(&mut tex)) }.context("CreateTexture2D(NV12)")?;
     }
     Ok(tex.unwrap())
 }
@@ -73,8 +69,7 @@ impl Converter {
         };
         let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&content) }
             .context("CreateVideoProcessorEnumerator")?;
-        let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }
-            .context("CreateVideoProcessor")?;
+        let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }.context("CreateVideoProcessor")?;
 
         let in_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
             FourCC: 0,
@@ -87,15 +82,8 @@ impl Converter {
             },
         };
         let mut input_view = None;
-        unsafe {
-            video_device.CreateVideoProcessorInputView(
-                src,
-                &enumerator,
-                &in_desc,
-                Some(&mut input_view),
-            )
-        }
-        .context("CreateVideoProcessorInputView")?;
+        unsafe { video_device.CreateVideoProcessorInputView(src, &enumerator, &in_desc, Some(&mut input_view)) }
+            .context("CreateVideoProcessorInputView")?;
 
         let out_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
             ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
@@ -107,15 +95,8 @@ impl Converter {
         for _ in 0..pool {
             let tex = create_nv12_texture(gpu, out_w, out_h)?;
             let mut view = None;
-            unsafe {
-                video_device.CreateVideoProcessorOutputView(
-                    &tex,
-                    &enumerator,
-                    &out_desc,
-                    Some(&mut view),
-                )
-            }
-            .context("CreateVideoProcessorOutputView")?;
+            unsafe { video_device.CreateVideoProcessorOutputView(&tex, &enumerator, &out_desc, Some(&mut view)) }
+                .context("CreateVideoProcessorOutputView")?;
             outputs.push((tex, view.unwrap()));
         }
 
@@ -127,11 +108,7 @@ impl Converter {
             };
             video_context.VideoProcessorSetStreamColorSpace(&processor, 0, &rgb_full);
             video_context.VideoProcessorSetOutputColorSpace(&processor, &ycc_709_limited);
-            video_context.VideoProcessorSetStreamFrameFormat(
-                &processor,
-                0,
-                D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-            );
+            video_context.VideoProcessorSetStreamFrameFormat(&processor, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
             video_context.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
             // Letterbox when aspect ratios differ.
             let (dst, full) = fit_rect(in_w, in_h, out_w, out_h);
@@ -185,12 +162,8 @@ impl Converter {
         };
         let mut streams = [stream];
         let r = unsafe {
-            self.video_context.VideoProcessorBlt(
-                &self.processor,
-                &self.outputs[index].1,
-                0,
-                &streams,
-            )
+            self.video_context
+                .VideoProcessorBlt(&self.processor, &self.outputs[index].1, 0, &streams)
         };
         unsafe { ManuallyDrop::drop(&mut streams[0].pInputSurface) };
         r.context("VideoProcessorBlt")

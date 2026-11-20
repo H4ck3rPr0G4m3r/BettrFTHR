@@ -16,8 +16,8 @@ use std::thread::JoinHandle;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::Threading::{
-    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, INFINITE, SetWaitableTimer,
-    TIMER_ALL_ACCESS, WaitForSingleObject,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, INFINITE, SetWaitableTimer, TIMER_ALL_ACCESS,
+    WaitForSingleObject,
 };
 
 const NV12_POOL: usize = 8;
@@ -75,8 +75,7 @@ impl VideoPipeline {
     pub fn start(monitor: Option<HMONITOR>, cfg: &VideoConfig) -> Result<Self> {
         let monitor = monitor.unwrap_or_else(d3d::primary_monitor);
         let gpu = d3d::create_for_monitor(monitor)?;
-        let capture =
-            MonitorCapture::start(&gpu, monitor, cfg.cursor).context("start screen capture")?;
+        let capture = MonitorCapture::start(&gpu, monitor, cfg.cursor).context("start screen capture")?;
         let (out_w, out_h) = output_size(capture.width, capture.height, cfg.target_height);
         let fps = cfg.fps.clamp(10, 240);
 
@@ -144,15 +143,13 @@ impl VideoPipeline {
             let shared = shared.clone();
             let latest = capture.latest.clone();
             let converter = Sendable(converter);
-            std::thread::Builder::new()
-                .name("video-ticker".into())
-                .spawn(move || {
-                    let converter = converter;
-                    if let Err(e) = run_ticker(&stop, &shared, &latest, &converter.0, fps, tx) {
-                        tracing::error!("video ticker failed: {e:#}");
-                        shared.failed.store(true, Ordering::SeqCst);
-                    }
-                })?
+            std::thread::Builder::new().name("video-ticker".into()).spawn(move || {
+                let converter = converter;
+                if let Err(e) = run_ticker(&stop, &shared, &latest, &converter.0, fps, tx) {
+                    tracing::error!("video ticker failed: {e:#}");
+                    shared.failed.store(true, Ordering::SeqCst);
+                }
+            })?
         };
 
         tracing::info!(adapter = %gpu.adapter_name, encoder = %encoder.name, out_w, out_h, fps, "video pipeline running");
@@ -172,11 +169,7 @@ impl VideoPipeline {
 
     pub fn snapshot(&self, seconds: u32) -> Option<VideoSnapshot> {
         let (sps, pps) = self.shared.params.lock().clone()?;
-        let packets = self
-            .shared
-            .ring
-            .lock()
-            .video_snapshot(seconds as i64 * HNS_PER_SEC);
+        let packets = self.shared.ring.lock().video_snapshot(seconds as i64 * HNS_PER_SEC);
         if packets.is_empty() {
             return None;
         }
@@ -277,15 +270,9 @@ unsafe impl Send for PreciseTimer {}
 
 impl PreciseTimer {
     pub fn new() -> Result<Self> {
-        let h = unsafe {
-            CreateWaitableTimerExW(
-                None,
-                None,
-                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                TIMER_ALL_ACCESS.0,
-            )
-        }
-        .context("CreateWaitableTimerExW")?;
+        let h =
+            unsafe { CreateWaitableTimerExW(None, None, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS.0) }
+                .context("CreateWaitableTimerExW")?;
         Ok(Self(h))
     }
 

@@ -4,12 +4,10 @@
 
 use anyhow::{Context, Result, anyhow};
 use windows::Win32::Foundation::{HMODULE, LUID, POINT, RECT};
-use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
-};
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
 };
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
 use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint};
@@ -72,13 +70,8 @@ pub fn create_for_monitor(monitor: HMONITOR) -> Result<Gpu> {
     let (adapter, rect) = match found {
         Some(f) => f,
         None => {
-            tracing::warn!(
-                "monitor not attached to any enumerated adapter; using the first adapter"
-            );
-            (
-                first.ok_or_else(|| anyhow!("no DXGI adapters"))?,
-                RECT::default(),
-            )
+            tracing::warn!("monitor not attached to any enumerated adapter; using the first adapter");
+            (first.ok_or_else(|| anyhow!("no DXGI adapters"))?, RECT::default())
         }
     };
     let desc = unsafe { adapter.GetDesc1() }?;

@@ -63,6 +63,10 @@ impl PacketRing {
         }
     }
 
+    pub fn newest_end(&self) -> Option<i64> {
+        self.packets.back().map(|p| p.pts + p.duration)
+    }
+
     pub fn push(&mut self, p: Packet) {
         if self.gop_trim && self.packets.is_empty() && !p.key {
             return; // never start a video ring on a non-keyframe
@@ -78,12 +82,7 @@ impl PacketRing {
         };
         if self.gop_trim {
             loop {
-                let next_key = self
-                    .packets
-                    .iter()
-                    .skip(1)
-                    .position(|p| p.key)
-                    .map(|i| i + 1);
+                let next_key = self.packets.iter().skip(1).position(|p| p.key).map(|i| i + 1);
                 let Some(k) = next_key else { break };
                 let old_enough = newest - self.packets[k].pts >= self.max_span;
                 if !(old_enough || self.bytes > self.max_bytes) {
@@ -157,14 +156,8 @@ mod tests {
         let snap = r.video_snapshot(100);
         assert!(snap[0].key);
         let newest = 990;
-        assert!(
-            newest - snap[0].pts >= 100,
-            "clip must cover the requested span"
-        );
-        assert!(
-            newest - snap[0].pts < 150,
-            "but not much more than one GOP extra"
-        );
+        assert!(newest - snap[0].pts >= 100, "clip must cover the requested span");
+        assert!(newest - snap[0].pts < 150, "but not much more than one GOP extra");
     }
 
     #[test]
