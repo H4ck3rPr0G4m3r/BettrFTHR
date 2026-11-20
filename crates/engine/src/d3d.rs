@@ -32,6 +32,7 @@ impl<T: Clone> Clone for Sendable<T> {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)] // monitor/rect are used by display-change recovery (M3)
 pub struct Gpu {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,

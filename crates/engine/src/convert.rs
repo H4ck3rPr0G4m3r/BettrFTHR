@@ -14,8 +14,6 @@ pub struct Converter {
     processor: ID3D11VideoProcessor,
     input_view: ID3D11VideoProcessorInputView,
     outputs: Vec<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)>,
-    pub out_width: u32,
-    pub out_height: u32,
 }
 
 pub fn create_nv12_texture(gpu: &Gpu, width: u32, height: u32) -> Result<ID3D11Texture2D> {
@@ -132,8 +130,6 @@ impl Converter {
             processor,
             input_view: input_view.unwrap(),
             outputs,
-            out_width: out_w,
-            out_height: out_h,
         })
     }
 

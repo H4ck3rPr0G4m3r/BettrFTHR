@@ -15,7 +15,9 @@ time. Then you trim it, mute your mic where needed, and drop it into Discord.
 - Instant replay clip on a hotkey (last N seconds, configurable).
 - Manual recording (start/stop).
 - Automatic game detection (clips are tagged and grouped by game).
-- Light editing: trim, mute/adjust the mic track per section.
+- Any number of audio sources (up to 8): playback devices (game, Discord…) and several
+  microphones/inputs. Each is its own track; track 1 is the mix players and Discord play.
+- Light editing: trim, mute/adjust any source track per section.
 - One-click Discord export (fits the size limit, copied to clipboard for Ctrl+V).
 - A polished, fast UI.
 
@@ -74,7 +76,7 @@ Key decisions (and why):
 ## Milestones
 
 1. **M1 — Video replay:** monitor capture, HW encode, ring buffer, MP4 save on hotkey (CLI).
-2. **M2 — Audio:** system loopback + mic as separate AAC tracks, clock-locked.
+2. **M2 — Audio:** N loopback/input sources, clock-locked, Mix + one AAC track per source.
 3. **M3 — Robustness:** resolution/monitor/device-lost recovery, logs, soak-test tool that
    saves clips for hours and validates each one (decode + A/V offset).
 4. **M4 — Manual recording:** streamed fragmented MP4 (crash-safe).

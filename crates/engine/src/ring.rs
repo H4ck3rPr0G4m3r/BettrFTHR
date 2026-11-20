@@ -43,11 +43,7 @@ impl PacketRing {
         }
     }
 
-    pub fn clear(&mut self) {
-        self.packets.clear();
-        self.bytes = 0;
-    }
-
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.packets.len()
     }

@@ -63,6 +63,7 @@ impl Timeline {
         ((t_hns - self.origin_hns) as i128 * RATE as i128 / HNS_PER_SEC as i128) as i64
     }
 
+    #[cfg(test)]
     pub fn written(&self) -> i64 {
         self.written
     }
@@ -110,14 +111,145 @@ impl Timeline {
 // ------------------------------------------------------------------------------------------
 // WASAPI source
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SourceKind {
-    SystemLoopback,
-    Microphone,
+    /// What a playback device plays (WASAPI loopback): game, Discord, music…
+    Output,
+    /// A recording device: microphone, line in, virtual cable…
+    Input,
+}
+
+/// One audio source. Any number of each kind; every source becomes its own track and is
+/// summed into the Mix track.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SourceSpec {
+    pub kind: SourceKind,
+    /// Endpoint ID, or a case-insensitive part of the device name. `None` follows the
+    /// Windows default device (also when the default changes).
+    #[serde(default)]
+    pub device: Option<String>,
+    /// Track name in the clip; defaults to "Game"/"Mic" or the device text.
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default = "one")]
+    pub gain: f32,
+}
+
+fn one() -> f32 {
+    1.0
+}
+
+impl SourceSpec {
+    pub fn default_output() -> Self {
+        Self {
+            kind: SourceKind::Output,
+            device: None,
+            label: None,
+            gain: 1.0,
+        }
+    }
+
+    pub fn default_input() -> Self {
+        Self {
+            kind: SourceKind::Input,
+            device: None,
+            label: None,
+            gain: 1.0,
+        }
+    }
+
+    /// CLI form: `default`, `<device text>`, optionally `@<gain>` (e.g. `Shure@0.8`).
+    pub fn parse(kind: SourceKind, s: &str) -> Result<Self> {
+        let (dev, gain) = match s.rsplit_once('@') {
+            Some((d, g)) => (d, g.parse::<f32>().context("bad gain")?),
+            None => (s, 1.0),
+        };
+        let device = (!dev.is_empty() && !dev.eq_ignore_ascii_case("default")).then(|| dev.to_owned());
+        Ok(Self {
+            kind,
+            device,
+            label: None,
+            gain,
+        })
+    }
+
+    fn flow(&self) -> EDataFlow {
+        if self.kind == SourceKind::Output {
+            eRender
+        } else {
+            eCapture
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DeviceInfo {
+    pub kind: SourceKind,
+    pub id: String,
+    pub name: String,
+    pub default: bool,
+}
+
+/// Active audio endpoints, for the settings UI / `--list-audio`.
+pub fn list_devices() -> Result<Vec<DeviceInfo>> {
+    let mut out = Vec::new();
+    unsafe {
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        for (kind, flow) in [(SourceKind::Output, eRender), (SourceKind::Input, eCapture)] {
+            let default_id = enumerator
+                .GetDefaultAudioEndpoint(flow, eConsole)
+                .ok()
+                .and_then(|d| device_id(&d));
+            let coll = enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE)?;
+            for i in 0..coll.GetCount()? {
+                let d = coll.Item(i)?;
+                let Some(id) = device_id(&d) else { continue };
+                out.push(DeviceInfo {
+                    kind,
+                    default: default_id.as_deref() == Some(id.as_str()),
+                    name: device_name(&d).unwrap_or_default(),
+                    id,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn device_id(d: &IMMDevice) -> Option<String> {
+    unsafe {
+        let p = d.GetId().ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const _));
+        s
+    }
+}
+
+fn resolve_device(spec: &SourceSpec) -> Result<IMMDevice> {
+    unsafe {
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let Some(want) = spec.device.as_deref() else {
+            return enumerator
+                .GetDefaultAudioEndpoint(spec.flow(), eConsole)
+                .context("no default audio device");
+        };
+        if let Ok(d) = enumerator.GetDevice(&windows::core::HSTRING::from(want)) {
+            return Ok(d);
+        }
+        let needle = want.to_lowercase();
+        let coll = enumerator.EnumAudioEndpoints(spec.flow(), DEVICE_STATE_ACTIVE)?;
+        for i in 0..coll.GetCount()? {
+            let d = coll.Item(i)?;
+            if device_name(&d).is_some_and(|n| n.to_lowercase().contains(&needle)) {
+                return Ok(d);
+            }
+        }
+        bail!("audio device {want:?} not found (unplugged?)")
+    }
 }
 
 struct Source {
-    kind: SourceKind,
     client: IAudioClient,
     capture: IAudioCaptureClient,
     name: String,
@@ -144,22 +276,15 @@ fn float_stereo_48k() -> WAVEFORMATEXTENSIBLE {
 }
 
 impl Source {
-    fn open(kind: SourceKind) -> Result<Self> {
+    fn open(spec: &SourceSpec) -> Result<Self> {
+        let kind = spec.kind;
         unsafe {
-            let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-            let flow = if kind == SourceKind::SystemLoopback {
-                eRender
-            } else {
-                eCapture
-            };
-            let device = enumerator
-                .GetDefaultAudioEndpoint(flow, eConsole)
-                .context("no default audio device")?;
+            let device = resolve_device(spec)?;
             let name = device_name(&device).unwrap_or_else(|| "unknown device".into());
             let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
             let fmt = float_stereo_48k();
             let mut flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-            if kind == SourceKind::SystemLoopback {
+            if kind == SourceKind::Output {
                 flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
             }
             // 200 ms buffer; we poll every 10 ms.
@@ -175,13 +300,7 @@ impl Source {
                 .context("IAudioClient::Initialize")?;
             let capture: IAudioCaptureClient = client.GetService()?;
             client.Start()?;
-            tracing::info!(?kind, device = %name, "audio source opened");
-            Ok(Self {
-                kind,
-                client,
-                capture,
-                name,
-            })
+            Ok(Self { client, capture, name })
         }
     }
 
@@ -368,19 +487,23 @@ fn find_aac_encoder() -> Result<IMFTransform> {
 
 #[derive(Clone, Debug)]
 pub struct AudioConfig {
-    pub mic: bool,
-    pub game_gain: f32,
-    pub mic_gain: f32,
+    pub sources: Vec<SourceSpec>,
     pub replay_seconds: u32,
+}
+
+pub const MAX_SOURCES: usize = 8;
+
+pub struct TrackShared {
+    pub spec: SourceSpec,
+    pub name: String,
+    pub ring: Mutex<PacketRing>,
+    /// Friendly name of the device currently open ("" while unavailable).
+    pub device: Mutex<String>,
 }
 
 pub struct AudioShared {
     pub mix: Mutex<PacketRing>,
-    pub game: Mutex<PacketRing>,
-    pub mic: Mutex<PacketRing>,
-    pub mic_enabled: bool,
-    pub game_device: Mutex<String>,
-    pub mic_device: Mutex<String>,
+    pub tracks: Vec<TrackShared>,
 }
 
 impl AudioShared {
@@ -390,12 +513,11 @@ impl AudioShared {
         let pick = |r: &Mutex<PacketRing>| r.lock().range(start - half, end);
         AudioSnapshot {
             mix: pick(&self.mix),
-            game: pick(&self.game),
-            mic: if self.mic_enabled { pick(&self.mic) } else { Vec::new() },
+            tracks: self.tracks.iter().map(|t| (t.name.clone(), pick(&t.ring))).collect(),
         }
     }
 
-    /// The newest audio time already encoded (hns), across all tracks.
+    /// The newest audio time already encoded (hns).
     pub fn encoded_until(&self) -> i64 {
         self.mix.lock().newest_end().unwrap_or(i64::MIN)
     }
@@ -403,8 +525,8 @@ impl AudioShared {
 
 pub struct AudioSnapshot {
     pub mix: Vec<Packet>,
-    pub game: Vec<Packet>,
-    pub mic: Vec<Packet>,
+    /// (track name, packets) per source, in configuration order.
+    pub tracks: Vec<(String, Vec<Packet>)>,
 }
 
 pub struct AudioEngine {
@@ -415,17 +537,51 @@ pub struct AudioEngine {
 
 const AUDIO_MAX_BYTES: usize = 256 << 20;
 
+/// Track names: "Game"/"Mic" for default devices, otherwise the label or device text;
+/// duplicates get a number.
+fn track_names(sources: &[SourceSpec]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for s in sources {
+        let base = s.label.clone().unwrap_or_else(|| match (&s.device, s.kind) {
+            (None, SourceKind::Output) => "Game".into(),
+            (None, SourceKind::Input) => "Mic".into(),
+            (Some(d), _) => d.clone(),
+        });
+        let mut name = base.clone();
+        let mut n = 2;
+        while names.contains(&name) {
+            name = format!("{base} {n}");
+            n += 1;
+        }
+        names.push(name);
+    }
+    names
+}
+
 impl AudioEngine {
     pub fn start(cfg: AudioConfig) -> Result<Self> {
+        if cfg.sources.is_empty() {
+            bail!("no audio sources configured");
+        }
+        if cfg.sources.len() > MAX_SOURCES {
+            bail!("at most {MAX_SOURCES} audio sources are supported");
+        }
         // Keep a little more audio than video so alignment never runs short.
         let span = (cfg.replay_seconds as i64 + 3) * HNS_PER_SEC;
+        let tracks = cfg
+            .sources
+            .iter()
+            .zip(track_names(&cfg.sources))
+            .map(|(spec, name)| TrackShared {
+                spec: spec.clone(),
+                name,
+                ring: Mutex::new(PacketRing::audio(span, AUDIO_MAX_BYTES)),
+                device: Mutex::new(String::new()),
+            })
+            .collect();
         let shared = Arc::new(AudioShared {
             mix: Mutex::new(PacketRing::audio(span, AUDIO_MAX_BYTES)),
-            game: Mutex::new(PacketRing::audio(span, AUDIO_MAX_BYTES)),
-            mic: Mutex::new(PacketRing::audio(span, AUDIO_MAX_BYTES)),
-            mic_enabled: cfg.mic,
-            game_device: Mutex::new(String::new()),
-            mic_device: Mutex::new(String::new()),
+            tracks,
         });
         let stop = Arc::new(AtomicBool::new(false));
         let (init_tx, init_rx) = crossbeam_channel::bounded::<Result<()>>(1);
@@ -434,7 +590,7 @@ impl AudioEngine {
             let stop = stop.clone();
             std::thread::Builder::new().name("audio".into()).spawn(move || {
                 let _com = ComScope::init();
-                if let Err(e) = run_audio(&cfg, &shared, &stop, init_tx) {
+                if let Err(e) = run_audio(&shared, &stop, init_tx) {
                     tracing::error!("audio engine stopped: {e:#}");
                 }
             })?
@@ -495,24 +651,29 @@ impl Track {
 }
 
 struct SourceSlot {
-    kind: SourceKind,
     source: Option<Source>,
     timeline: Timeline,
     retry_at: i64,
+    warned: bool,
 }
 
 impl SourceSlot {
-    fn poll(&mut self, scratch: &mut Vec<f32>, device_label: &Mutex<String>) {
+    fn poll(&mut self, shared: &TrackShared, scratch: &mut Vec<f32>) {
         let now = clock::now_hns();
         if self.source.is_none() && now >= self.retry_at {
-            match Source::open(self.kind) {
+            match Source::open(&shared.spec) {
                 Ok(s) => {
-                    *device_label.lock() = s.name.clone();
+                    tracing::info!(track = %shared.name, device = %s.name, "audio source opened");
+                    *shared.device.lock() = s.name.clone();
                     self.source = Some(s);
+                    self.warned = false;
                 }
                 Err(e) => {
-                    tracing::warn!(kind = ?self.kind, "audio source unavailable: {e:#}");
-                    device_label.lock().clear();
+                    if !self.warned {
+                        tracing::warn!(track = %shared.name, "audio source unavailable: {e:#}");
+                        self.warned = true;
+                    }
+                    shared.device.lock().clear();
                     self.retry_at = now + 2 * HNS_PER_SEC;
                 }
             }
@@ -520,77 +681,64 @@ impl SourceSlot {
         if let Some(s) = &mut self.source {
             if let Err(e) = s.drain(&mut self.timeline, scratch) {
                 // Typically AUDCLNT_E_DEVICE_INVALIDATED: headset unplugged / default changed.
-                tracing::warn!(kind = ?self.kind, "audio source lost: {e:#}; reopening");
+                tracing::warn!(track = %shared.name, "audio source lost: {e:#}; reopening");
                 self.source = None;
                 self.retry_at = now + HNS_PER_SEC / 2;
             }
         }
+        // A missing or quiet source still advances, as silence.
         self.timeline.pad_until(now - PAD_LAG_HNS);
     }
 }
 
-fn run_audio(
-    cfg: &AudioConfig,
-    shared: &AudioShared,
-    stop: &AtomicBool,
-    init: crossbeam_channel::Sender<Result<()>>,
-) -> Result<()> {
+fn run_audio(shared: &AudioShared, stop: &AtomicBool, init: crossbeam_channel::Sender<Result<()>>) -> Result<()> {
     let origin = clock::now_hns();
-    let mut tracks = match (|| -> Result<_> { Ok((Track::new()?, Track::new()?, Track::new()?)) })() {
+    let n = shared.tracks.len();
+    let encoders = (|| -> Result<_> {
+        let mix = Track::new()?;
+        let per: Vec<Track> = (0..n).map(|_| Track::new()).collect::<Result<_>>()?;
+        Ok((mix, per))
+    })();
+    let (mut mix_track, mut tracks) = match encoders {
         Ok(t) => t,
         Err(e) => {
             let _ = init.send(Err(anyhow!("{e:#}")));
             return Err(e);
         }
     };
-    let mut game = SourceSlot {
-        kind: SourceKind::SystemLoopback,
-        source: None,
-        timeline: Timeline::new(origin),
-        retry_at: 0,
-    };
-    let mut mic = SourceSlot {
-        kind: SourceKind::Microphone,
-        source: None,
-        timeline: Timeline::new(origin),
-        retry_at: 0,
-    };
+    let mut slots: Vec<SourceSlot> = (0..n)
+        .map(|_| SourceSlot {
+            source: None,
+            timeline: Timeline::new(origin),
+            retry_at: 0,
+            warned: false,
+        })
+        .collect();
     let _ = init.send(Ok(()));
 
     let block = AAC_FRAME as usize;
-    let (mut scratch, mut g, mut m, mut mix) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let mut silence = Vec::new();
+    let mut scratch = Vec::new();
+    let mut bufs: Vec<Vec<f32>> = vec![Vec::new(); n];
+    let mut mix = Vec::new();
     while !stop.load(Ordering::Relaxed) {
-        game.poll(&mut scratch, &shared.game_device);
-        if cfg.mic {
-            mic.poll(&mut scratch, &shared.mic_device);
+        for (slot, t) in slots.iter_mut().zip(&shared.tracks) {
+            slot.poll(t, &mut scratch);
         }
-        loop {
-            let ready = if cfg.mic {
-                game.timeline.pending_frames().min(mic.timeline.pending_frames())
-            } else {
-                game.timeline.pending_frames()
-            };
-            if ready < block {
-                break;
-            }
-            game.timeline.take(block, &mut g);
-            if cfg.mic {
-                mic.timeline.take(block, &mut m);
-            } else {
-                silence.resize(g.len(), 0.0);
-                m.clone_from(&silence);
-            }
+        while slots.iter().map(|s| s.timeline.pending_frames()).min().unwrap_or(0) >= block {
             mix.clear();
-            mix.extend(
-                g.iter()
-                    .zip(&m)
-                    .map(|(a, b)| soft_clip(a * cfg.game_gain + b * cfg.mic_gain)),
-            );
-            tracks.0.encode(origin, &mix, &shared.mix)?;
-            tracks.1.encode(origin, &g, &shared.game)?;
-            if cfg.mic {
-                tracks.2.encode(origin, &m, &shared.mic)?;
+            mix.resize(block * CHANNELS as usize, 0.0);
+            for ((slot, buf), t) in slots.iter_mut().zip(bufs.iter_mut()).zip(&shared.tracks) {
+                slot.timeline.take(block, buf);
+                for (m, x) in mix.iter_mut().zip(buf.iter()) {
+                    *m += x * t.spec.gain;
+                }
+            }
+            for m in mix.iter_mut() {
+                *m = soft_clip(*m);
+            }
+            mix_track.encode(origin, &mix, &shared.mix)?;
+            for ((track, buf), t) in tracks.iter_mut().zip(&bufs).zip(&shared.tracks) {
+                track.encode(origin, buf, &t.ring)?;
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -694,6 +842,28 @@ mod tests {
         let mut t = Timeline::new(1_000);
         t.pad_until(1_000 + HNS_PER_SEC);
         assert_eq!(t.written(), 48_000);
+    }
+
+    #[test]
+    fn track_names_are_unique_and_friendly() {
+        let specs = vec![
+            SourceSpec::default_output(),
+            SourceSpec::default_input(),
+            SourceSpec::parse(SourceKind::Input, "Shure").unwrap(),
+            SourceSpec::parse(SourceKind::Input, "Shure@0.5").unwrap(),
+            SourceSpec {
+                label: Some("Friend".into()),
+                ..SourceSpec::default_input()
+            },
+        ];
+        assert_eq!(track_names(&specs), vec!["Game", "Mic", "Shure", "Shure 2", "Friend"]);
+        assert_eq!(specs[3].gain, 0.5);
+        assert!(
+            SourceSpec::parse(SourceKind::Output, "default")
+                .unwrap()
+                .device
+                .is_none()
+        );
     }
 
     #[test]

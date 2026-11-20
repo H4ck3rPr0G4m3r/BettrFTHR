@@ -16,7 +16,7 @@ mod pipeline;
 mod ring;
 
 use anyhow::{Context, Result};
-use audio::{AudioConfig, AudioEngine};
+use audio::{AudioConfig, AudioEngine, SourceKind, SourceSpec};
 use pipeline::{VideoConfig, VideoPipeline};
 use serde_json::json;
 use std::io::{BufRead, Write};
@@ -32,6 +32,7 @@ struct Args {
     audio: AudioConfig,
     save_key: String,
     list_encoders: bool,
+    list_audio: bool,
     selftest_aac: Option<PathBuf>,
 }
 
@@ -46,15 +47,15 @@ fn parse_args() -> Result<Args> {
             replay_seconds: 30,
         },
         audio: AudioConfig {
-            mic: true,
-            game_gain: 1.0,
-            mic_gain: 1.0,
+            sources: Vec::new(),
             replay_seconds: 30,
         },
         save_key: "F9".into(),
         list_encoders: false,
+        list_audio: false,
         selftest_aac: None,
     };
+    let mut no_mic = false;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut val = || it.next().with_context(|| format!("{arg} needs a value"));
@@ -66,16 +67,24 @@ fn parse_args() -> Result<Args> {
             "--seconds" => a.video.replay_seconds = val()?.parse()?,
             "--save-key" => a.save_key = val()?,
             "--no-cursor" => a.video.cursor = false,
-            "--no-mic" => a.audio.mic = false,
-            "--mic-gain" => a.audio.mic_gain = val()?.parse()?,
-            "--game-gain" => a.audio.game_gain = val()?.parse()?,
+            // Repeatable: --output default --input "Shure" --input "Line 1@0.7"
+            "--output" => a.audio.sources.push(SourceSpec::parse(SourceKind::Output, &val()?)?),
+            "--input" => a.audio.sources.push(SourceSpec::parse(SourceKind::Input, &val()?)?),
+            "--no-mic" => no_mic = true,
             "--list-encoders" => a.list_encoders = true,
+            "--list-audio" => a.list_audio = true,
             "--selftest-aac" => a.selftest_aac = Some(PathBuf::from(val()?)),
             "--cli" => {}
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
     a.audio.replay_seconds = a.video.replay_seconds;
+    if a.audio.sources.is_empty() {
+        a.audio.sources.push(SourceSpec::default_output());
+        if !no_mic {
+            a.audio.sources.push(SourceSpec::default_input());
+        }
+    }
     Ok(a)
 }
 
@@ -150,7 +159,10 @@ fn save_clip(video: &VideoPipeline, audio: Option<&AudioEngine>, seconds: u32, o
         let mut tracks = Vec::new();
         if let Some(s) = &sound {
             // Track order matters: players and Discord play the first (enabled) one.
-            for (name, packets, enabled) in [("Mix", &s.mix, true), ("Game", &s.game, false), ("Mic", &s.mic, false)] {
+            // The separate per-source stems follow, disabled, for the editor.
+            let all =
+                std::iter::once(("Mix", &s.mix, true)).chain(s.tracks.iter().map(|(n, p)| (n.as_str(), p, false)));
+            for (name, packets, enabled) in all {
                 if !packets.is_empty() {
                     tracks.push(mp4::AudioTrack {
                         name,
@@ -225,6 +237,12 @@ fn main() -> Result<()> {
         println!("all encoders:    {:?}", encoder::list_hardware_h264(None));
         return Ok(());
     }
+    if args.list_audio {
+        for d in audio::list_devices()? {
+            println!("{}", serde_json::to_string(&d)?);
+        }
+        return Ok(());
+    }
     if let Some(path) = &args.selftest_aac {
         audio::selftest_aac(path)?;
         println!("wrote {} (clicks at 0.5 s and 1.0 s)", path.display());
@@ -247,7 +265,7 @@ fn main() -> Result<()> {
         "width": video.width,
         "height": video.height,
         "fps": video.fps,
-        "audio": audio.is_some(),
+        "audio_tracks": audio.as_ref().map(|a| a.shared.tracks.iter().map(|t| t.name.clone()).collect::<Vec<_>>()),
     }));
 
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<Command>();
@@ -283,9 +301,15 @@ fn main() -> Result<()> {
             Ok(Command::Status) => {
                 let s = &video.shared.stats;
                 let ring = video.shared.ring.lock();
-                let (game_dev, mic_dev) = audio
+                let sources: Vec<_> = audio
                     .as_ref()
-                    .map(|a| (a.shared.game_device.lock().clone(), a.shared.mic_device.lock().clone()))
+                    .map(|a| {
+                        a.shared
+                            .tracks
+                            .iter()
+                            .map(|t| json!({"track": t.name, "kind": t.spec.kind, "device": *t.device.lock()}))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 emit(json!({
                     "event": "status",
@@ -295,8 +319,7 @@ fn main() -> Result<()> {
                     "captured": s.captured.load(Ordering::Relaxed),
                     "buffered_seconds": ring.span() as f64 / 1e7,
                     "buffered_mb": ring.bytes() as f64 / 1048576.0,
-                    "game_device": game_dev,
-                    "mic_device": mic_dev,
+                    "audio_sources": sources,
                 }));
             }
             Ok(Command::Quit) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,

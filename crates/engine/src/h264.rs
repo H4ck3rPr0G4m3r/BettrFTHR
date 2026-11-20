@@ -1,6 +1,5 @@
 //! Minimal H.264 bitstream helpers: Annex B → AVCC (length-prefixed) and parameter sets.
 
-pub const NAL_SLICE: u8 = 1;
 pub const NAL_IDR: u8 = 5;
 pub const NAL_SPS: u8 = 7;
 pub const NAL_PPS: u8 = 8;
