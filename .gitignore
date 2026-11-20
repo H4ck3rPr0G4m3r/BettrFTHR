@@ -1,0 +1,7 @@
+/target
+/upstream
+node_modules/
+dist/
+*.tmp
+/clips
+.vscode/
