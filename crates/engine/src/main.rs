@@ -26,8 +26,73 @@ use std::sync::atomic::Ordering;
 use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFStartup};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
+/// Engine settings as JSON (all fields optional). The app writes this file and restarts the
+/// engine when settings change, which is simpler and more robust than live reconfiguration.
+///
+/// ```json
+/// { "out_dir": "D:/Clips", "replay_seconds": 60, "fps": 60, "bitrate_kbps": 25000,
+///   "height": 1080, "cursor": true, "hotkeys": { "save": "F9", "record": "F10" },
+///   "audio": [ { "kind": "output" }, { "kind": "input", "device": "Shure", "gain": 0.8 } ] }
+/// ```
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct EngineConfig {
+    out_dir: Option<PathBuf>,
+    replay_seconds: Option<u32>,
+    fps: Option<u32>,
+    bitrate_kbps: Option<u32>,
+    height: Option<u32>,
+    cursor: Option<bool>,
+    hotkeys: Option<HotkeyConfig>,
+    audio: Option<Vec<SourceSpec>>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct HotkeyConfig {
+    save: Option<String>,
+    record: Option<String>,
+}
+
+impl EngineConfig {
+    fn apply(self, a: &mut Args) {
+        if let Some(v) = self.out_dir {
+            a.out_dir = v;
+        }
+        if let Some(v) = self.replay_seconds {
+            a.video.replay_seconds = v.clamp(5, 600);
+        }
+        if let Some(v) = self.fps {
+            a.video.fps = v;
+        }
+        if let Some(v) = self.bitrate_kbps {
+            a.video.bitrate_kbps = v.clamp(1_000, 150_000);
+        }
+        if let Some(v) = self.height {
+            a.video.target_height = v;
+        }
+        if let Some(v) = self.cursor {
+            a.video.cursor = v;
+        }
+        if let Some(h) = self.hotkeys {
+            if let Some(k) = h.save {
+                a.save_key = k;
+            }
+            if let Some(k) = h.record {
+                a.record_key = k;
+            }
+        }
+        if let Some(sources) = self.audio {
+            a.audio.sources = sources;
+            a.explicit_audio = true;
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Args {
+    /// Audio sources were configured explicitly (an empty list then means "no audio").
+    explicit_audio: bool,
     out_dir: PathBuf,
     video: VideoConfig,
     audio: AudioConfig,
@@ -40,6 +105,7 @@ struct Args {
 
 fn parse_args() -> Result<Args> {
     let mut a = Args {
+        explicit_audio: false,
         out_dir: PathBuf::from("clips"),
         video: VideoConfig {
             fps: 60,
@@ -63,6 +129,13 @@ fn parse_args() -> Result<Args> {
     while let Some(arg) = it.next() {
         let mut val = || it.next().with_context(|| format!("{arg} needs a value"));
         match arg.as_str() {
+            // Settings file written by the app; flags after it override single values.
+            "--config" => {
+                let path = val()?;
+                let text = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
+                let c: EngineConfig = serde_json::from_str(&text).with_context(|| format!("parse {path}"))?;
+                c.apply(&mut a);
+            }
             "--out" => a.out_dir = PathBuf::from(val()?),
             "--fps" => a.video.fps = val()?.parse()?,
             "--bitrate" => a.video.bitrate_kbps = val()?.parse()?,
@@ -83,7 +156,7 @@ fn parse_args() -> Result<Args> {
         }
     }
     a.audio.replay_seconds = a.video.replay_seconds;
-    if a.audio.sources.is_empty() {
+    if a.audio.sources.is_empty() && !a.explicit_audio {
         a.audio.sources.push(SourceSpec::default_output());
         if !no_mic {
             a.audio.sources.push(SourceSpec::default_input());
@@ -104,6 +177,7 @@ enum Command {
     RecordStop,
     RecordToggle,
     Status,
+    ListAudio,
     Quit,
 }
 
@@ -124,6 +198,7 @@ fn parse_command(line: &str) -> Option<Command> {
         "record_stop" => Some(Command::RecordStop),
         "record_toggle" => Some(Command::RecordToggle),
         "status" => Some(Command::Status),
+        "list_audio" => Some(Command::ListAudio),
         "quit" | "exit" => Some(Command::Quit),
         _ => None,
     }
@@ -296,6 +371,7 @@ fn main() -> Result<()> {
     let mut video = VideoPipeline::start(None, &args.video)?;
     let mut audio = match AudioEngine::start(args.audio.clone()) {
         Ok(a) => Some(a),
+        Err(_) if args.audio.sources.is_empty() => None, // audio deliberately off
         Err(e) => {
             tracing::error!("audio disabled: {e:#}");
             emit(json!({"event": "warning", "message": format!("audio disabled: {e:#}")}));
@@ -362,6 +438,10 @@ fn main() -> Result<()> {
                 }
             }
             Ok(Command::RecordStart | Command::RecordToggle) => {}
+            Ok(Command::ListAudio) => match audio::list_devices() {
+                Ok(devices) => emit(json!({"event": "audio_devices", "devices": devices})),
+                Err(e) => emit(json!({"event": "error", "message": format!("list audio devices: {e:#}")})),
+            },
             Ok(Command::Status) => {
                 let s = &video.shared.stats;
                 let ring = video.shared.ring.lock();
