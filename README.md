@@ -9,7 +9,8 @@ with a Rust capture engine and a focus on stability over features. See
 
 ## Status
 
-Early development. The engine is being built and tested first.
+The capture engine works (replay clips, manual recording, multi-source audio). The desktop
+app (tray, library, editor, Discord export) is next.
 
 ## Building
 
@@ -17,9 +18,44 @@ Requirements: Windows 10 1903+ / 11, Rust (stable, MSVC toolchain).
 
 ```sh
 cargo build --release
-# replay-buffer test harness: F9 saves the last 30 s to ./clips
-target/release/bettr-engine.exe --cli
 ```
+
+## Using the engine directly
+
+`target/release/bettr-engine.exe` runs headless. While it runs:
+
+| Key | Action |
+|-----|--------|
+| **F9** | Save the last 30 s to `./clips` |
+| **F10** | Start / stop a recording |
+
+Useful flags:
+
+```sh
+bettr-engine --seconds 60 --out D:\Clips          # longer replay, other folder
+bettr-engine --height 1080 --bitrate 25000         # downscale 1440p → 1080p, 25 Mbps
+bettr-engine --list-audio                          # show audio devices
+bettr-engine --output default --input "Shure" --input "Line 1@0.7"   # several mics, per-source gain
+bettr-engine --config settings.json                # everything from a JSON file (see main.rs)
+```
+
+While it runs you can also type commands into the console: `save` (or `save 15` for the last
+15 s), `record`, `status`, `list-audio`, `game VALORANT` (clips then go to `clips/VALORANT/`),
+`help`, `quit`. The app sends the same commands as JSON lines (`{"cmd":"save","seconds":15}`)
+and reads events back as JSON lines on stdout. Logs go to stderr (`RUST_LOG=debug` for more).
+
+Each clip contains the video, a **Mix** audio track (what players and Discord play) and
+one extra track per audio source, so the editor can mute or rebalance each one.
+
+## Testing
+
+```sh
+cargo test
+python tools/soak.py --minutes 30          # saves clips on a loop and validates every one
+```
+
+`soak.py` expects ffmpeg/ffprobe in `.tools/ffmpeg-master-latest-win64-gpl/bin` (or pass
+`--ffmpeg-dir`).
 
 ## License
 
