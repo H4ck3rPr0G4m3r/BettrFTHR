@@ -6,7 +6,9 @@
 //! - packets that arrive late leave a gap → filled with silence;
 //! - packets that overlap what was already written are trimmed;
 //! - when a source goes quiet (loopback stops delivering when nothing plays, unplugged mic)
-//!   the timeline is padded with silence up to "now − latency".
+//!   the timeline is padded with silence up to "now − latency";
+//! - stamps a driver puts in the future (Realtek USB loopback: ~1 s) are pulled back to
+//!   when the audio was really captured (`StampFix`).
 //! So sample N of every track always means the same wall-clock instant as the video frame
 //! stamped with that time. That is the whole A/V sync story.
 
@@ -105,6 +107,66 @@ impl Timeline {
 
     pub fn pending_frames(&self) -> usize {
         self.pending.len() / CHANNELS as usize
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// Device timestamp sanity
+
+/// Removes a device's "future" timestamp error.
+///
+/// Some drivers (seen: Realtek USB Audio in loopback) stamp packets ~1 s or more after the
+/// moment their audio was captured, so trusting the stamp places that source's sound late in
+/// every clip. A packet's first frame can never have been captured after `now - duration`;
+/// how far a stamp lands beyond that is the device's error minus our (small, positive)
+/// pickup delay. The largest such excess over a recent window estimates the error, and it is
+/// subtracted from every stamp. Honest devices never exceed the bound, so they are untouched.
+#[derive(Default)]
+pub struct StampFix {
+    correction: i64,
+    window_max: i64,
+    window_end: i64,
+    warned: bool,
+}
+
+/// How long a lower error must persist before the correction relaxes to it.
+const STAMP_WINDOW_HNS: i64 = 2 * HNS_PER_SEC;
+
+impl StampFix {
+    /// Corrected capture time for a packet stamped `stamp` that reached us at `now` and
+    /// holds `dur` of audio (all hns, QPC timebase).
+    pub fn correct(&mut self, stamp: i64, now: i64, dur: i64) -> i64 {
+        let excess = stamp - (now - dur);
+        // Never place audio in the future: raise immediately.
+        self.correction = self.correction.max(excess);
+        if self.window_end == 0 {
+            self.window_end = now + STAMP_WINDOW_HNS;
+            self.window_max = excess;
+        } else {
+            self.window_max = self.window_max.max(excess);
+        }
+        if now >= self.window_end {
+            // Follow a device whose error shrank (or vanished) since.
+            self.correction = self.window_max.max(0);
+            self.window_max = i64::MIN;
+            self.window_end = now + STAMP_WINDOW_HNS;
+        }
+        self.correction = self.correction.max(0);
+        stamp - self.correction
+    }
+
+    /// Current correction in hns (0 for honest devices).
+    pub fn correction(&self) -> i64 {
+        self.correction
+    }
+
+    /// True once per source, the first time the error is large enough to mention.
+    fn should_warn(&mut self) -> bool {
+        if !self.warned && self.correction > 50 * HNS_PER_SEC / 1000 {
+            self.warned = true;
+            return true;
+        }
+        false
     }
 }
 
@@ -253,6 +315,7 @@ struct Source {
     client: IAudioClient,
     capture: IAudioCaptureClient,
     name: String,
+    stamps: StampFix,
 }
 
 fn float_stereo_48k() -> WAVEFORMATEXTENSIBLE {
@@ -300,7 +363,12 @@ impl Source {
                 .context("IAudioClient::Initialize")?;
             let capture: IAudioCaptureClient = client.GetService()?;
             client.Start()?;
-            Ok(Self { client, capture, name })
+            Ok(Self {
+                client,
+                capture,
+                name,
+                stamps: StampFix::default(),
+            })
         }
     }
 
@@ -327,7 +395,17 @@ impl Source {
                 }
                 self.capture.ReleaseBuffer(frames)?;
                 // qpc is already in 100 ns units on the QPC timebase.
-                let t = if qpc != 0 { qpc as i64 } else { clock::now_hns() };
+                let now = clock::now_hns();
+                let dur = frames as i64 * HNS_PER_SEC / RATE as i64;
+                let stamp = if qpc != 0 { qpc as i64 } else { now - dur };
+                let t = self.stamps.correct(stamp, now, dur);
+                if self.stamps.should_warn() {
+                    tracing::warn!(
+                        device = %self.name,
+                        ms = self.stamps.correction() / 10_000,
+                        "audio device timestamps run ahead of real time; correcting"
+                    );
+                }
                 timeline.push(t, scratch);
             }
         }
@@ -835,6 +913,49 @@ mod tests {
         t.push(0, &frames(480));
         t.push(hns(480 + 100), &frames(480)); // 2 ms late: within tolerance
         assert_eq!(t.written(), 960);
+    }
+
+    // Packet of 480 frames (10 ms) that arrived at `now` and was truly captured `delay`
+    // before it could have been (i.e. at now - 10 ms - delay), stamped with `bias` error.
+    fn packet(fix: &mut StampFix, now: i64, delay: i64, bias: i64) -> i64 {
+        let dur = hns(480);
+        let truth = now - dur - delay;
+        fix.correct(truth + bias, now, dur) - truth
+    }
+
+    #[test]
+    fn honest_stamps_are_untouched() {
+        let mut fix = StampFix::default();
+        for i in 0..500 {
+            let now = HNS_PER_SEC + i * hns(480);
+            assert_eq!(packet(&mut fix, now, 20_000 + (i % 7) * 10_000, 0), 0);
+        }
+    }
+
+    #[test]
+    fn future_stamps_are_pulled_back() {
+        // Realtek USB loopback measured ~975 ms in the future.
+        let mut fix = StampFix::default();
+        let bias = 9_750_000;
+        let err = packet(&mut fix, HNS_PER_SEC, 0, bias);
+        assert!(err.abs() <= hns(10), "first packet already corrected, err {err}");
+        for i in 1..1000 {
+            let now = HNS_PER_SEC + i * hns(480);
+            let err = packet(&mut fix, now, (i % 5) * 20_000, bias);
+            assert!(err <= hns(10) && err >= -hns(10), "packet {i}: err {err}");
+        }
+    }
+
+    #[test]
+    fn correction_relaxes_when_the_device_recovers() {
+        let mut fix = StampFix::default();
+        packet(&mut fix, HNS_PER_SEC, 0, 20_000_000);
+        // Stamps become honest; after a few seconds no correction remains.
+        let mut last = 0;
+        for i in 1..1000 {
+            last = packet(&mut fix, HNS_PER_SEC + i * hns(480), 0, 0);
+        }
+        assert_eq!(last, 0);
     }
 
     #[test]
