@@ -63,7 +63,7 @@ Key decisions (and why):
   hotkeys live in the engine so a hung UI never costs a clip.
 - **Frames never leave the GPU.** Capture texture → video processor → hardware encoder.
 - **Constant frame rate tick** (OBS-style): the latest captured frame is encoded every tick,
-  duplicated when the screen is static. Fixed GOP → precise, predictable clip trimming.
+  duplicated when the screen is static. Fixed 0.5 s GOP: a clip starts at the keyframe closest to the requested length (±0.25 s, so "30 s" means 30 s) and the editor can cut on keyframes without re-encoding.
 - **No B-frames** → PTS == DTS, trivial muxing.
 - **One clock (QPC) for everything.** Video ticks and audio packets are stamped on QPC.
   Audio is written to a continuous timeline: gaps (WASAPI loopback goes quiet when nothing
