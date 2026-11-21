@@ -3,11 +3,14 @@
 //! Protocol: JSON lines. Commands on stdin (`{"cmd":"save"}` or just `save`), events on
 //! stdout. Logs go to stderr so stdout stays machine-readable.
 
+mod aacdec;
 mod audio;
 mod capture;
 mod clock;
 mod convert;
 mod d3d;
+mod demux;
+mod edit;
 mod encoder;
 mod h264;
 mod hotkey;
@@ -101,6 +104,8 @@ struct Args {
     list_encoders: bool,
     list_audio: bool,
     selftest_aac: Option<PathBuf>,
+    probe: Option<PathBuf>,
+    export: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -123,6 +128,8 @@ fn parse_args() -> Result<Args> {
         list_encoders: false,
         list_audio: false,
         selftest_aac: None,
+        probe: None,
+        export: None,
     };
     let mut no_mic = false;
     let mut it = std::env::args().skip(1);
@@ -151,6 +158,9 @@ fn parse_args() -> Result<Args> {
             "--list-encoders" => a.list_encoders = true,
             "--list-audio" => a.list_audio = true,
             "--selftest-aac" => a.selftest_aac = Some(PathBuf::from(val()?)),
+            // Editor back end (no capture): waveform/keyframe probe, and export jobs.
+            "--probe" => a.probe = Some(PathBuf::from(val()?)),
+            "--export" => a.export = Some(PathBuf::from(val()?)),
             "--cli" => {}
             other => anyhow::bail!("unknown argument {other}"),
         }
@@ -448,6 +458,24 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string(&d)?);
             }
         }
+        return Ok(());
+    }
+    if let Some(path) = &args.probe {
+        println!("{}", serde_json::to_string(&edit::probe(path)?)?);
+        return Ok(());
+    }
+    if let Some(job) = &args.export {
+        let text = std::fs::read_to_string(job).with_context(|| format!("read {}", job.display()))?;
+        let job: edit::ExportJob = serde_json::from_str(&text).context("parse export job")?;
+        let mut last = -1.0f64;
+        let res = edit::export(&job, &mut |phase, p| {
+            // Throttle: about one progress line per percent.
+            if p - last >= 0.01 || p >= 1.0 {
+                last = p;
+                emit(json!({"event": "progress", "phase": phase, "p": (p * 1000.0).round() / 1000.0}));
+            }
+        })?;
+        emit(json!({"event": "exported", "result": res}));
         return Ok(());
     }
     if let Some(path) = &args.selftest_aac {

@@ -50,6 +50,22 @@ struct SampleTable {
 }
 
 pub fn write_mp4(path: &Path, video: &VideoTrack, audio: &[AudioTrack]) -> Result<MuxStats> {
+    write_mp4_with(path, video, None, audio)
+}
+
+/// Video payloads read on demand while writing (exports of long recordings would not fit
+/// in memory). `video.packets` then carry timing and key flags; their `data` is ignored.
+pub struct VideoSource<'a> {
+    pub sizes: &'a [u32],
+    pub fetch: &'a mut dyn FnMut(usize) -> Result<Vec<u8>>,
+}
+
+pub fn write_mp4_with(
+    path: &Path,
+    video: &VideoTrack,
+    mut source: Option<VideoSource>,
+    audio: &[AudioTrack],
+) -> Result<MuxStats> {
     if video.packets.is_empty() {
         bail!("no video packets to write");
     }
@@ -79,7 +95,10 @@ pub fn write_mp4(path: &Path, video: &VideoTrack, audio: &[AudioTrack]) -> Resul
             Some(next) => (to_vts(next.pts).saturating_sub(start)).max(1) as u32,
             None => nominal,
         };
-        vt.sizes.push(p.data.len() as u32);
+        vt.sizes.push(match &source {
+            Some(src) => *src.sizes.get(i).context("video size missing")?,
+            None => p.data.len() as u32,
+        });
         vt.durations.push(dur);
         if p.key {
             vt.keys.push(i as u32 + 1);
@@ -140,12 +159,18 @@ pub fn write_mp4(path: &Path, video: &VideoTrack, audio: &[AudioTrack]) -> Resul
         w.write_all(b"mdat")?;
         w.write_all(&(16 + payload).to_be_bytes())?;
         for &(t, i, _) in &order {
-            let data = if t == 0 {
-                &video.packets[i].data
+            if t == 0 {
+                match source.as_mut() {
+                    Some(src) => {
+                        let data = (src.fetch)(i)?;
+                        anyhow::ensure!(data.len() as u32 == vt.sizes[i], "video sample {i} changed size");
+                        w.write_all(&data)?;
+                    }
+                    None => w.write_all(&video.packets[i].data)?,
+                }
             } else {
-                &audio[t - 1].packets[i].data
-            };
-            w.write_all(data)?;
+                w.write_all(&audio[t - 1].packets[i].data)?;
+            }
         }
         let f = w.into_inner().map_err(|e| e.into_error())?;
         f.sync_all()?;

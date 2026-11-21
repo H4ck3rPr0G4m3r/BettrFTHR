@@ -747,7 +747,7 @@ fn run_audio(shared: &AudioShared, stop: &AtomicBool, init: crossbeam_channel::S
 }
 
 /// Transparent below ~-1 dBFS, then a smooth knee instead of hard clipping.
-fn soft_clip(x: f32) -> f32 {
+pub fn soft_clip(x: f32) -> f32 {
     const KNEE: f32 = 0.9;
     let a = x.abs();
     if a <= KNEE {
