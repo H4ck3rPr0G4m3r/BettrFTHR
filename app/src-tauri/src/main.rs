@@ -175,6 +175,19 @@ fn open_clip_folder(app: AppHandle, state: State<AppState>) -> Res<()> {
     app.opener().open_path(dir.to_string_lossy(), None::<&str>).map_err(err)
 }
 
+/// The folder with engine.log (for bug reports).
+#[tauri::command]
+fn open_logs(app: AppHandle) -> Res<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = app.path().app_local_data_dir().map_err(err)?;
+    app.opener().open_path(dir.to_string_lossy(), None::<&str>).map_err(err)
+}
+
+#[tauri::command]
+fn app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
 #[tauri::command]
 fn reveal_clip(app: AppHandle, state: State<AppState>, path: PathBuf) -> Res<()> {
     use tauri_plugin_opener::OpenerExt;
@@ -446,6 +459,8 @@ fn main() {
             delete_clips,
             open_clip_folder,
             reveal_clip,
+            open_logs,
+            app_version,
             copy_clip,
             probe_clip,
             export_clip,
