@@ -1,0 +1,120 @@
+@import "tailwindcss";
+
+/*
+ * Dark-only on purpose: a capture app lives next to games and Discord, both dark.
+ * Shape rule: controls (buttons, inputs, chips) use radius-ctl, media and panels radius-card.
+ * One accent (lime). Red is reserved for "recording" state, amber for warnings.
+ */
+@theme {
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, monospace;
+
+  --color-bg: #0d0e10;
+  --color-panel: #121316;
+  --color-raised: #191a1e;
+  --color-hover: #202126;
+  --color-line: #24262b;
+  --color-line-strong: #33353c;
+  --color-fg: #ecedef;
+  --color-muted: #a0a3aa;
+  --color-faint: #6c6f77;
+  --color-accent: #c8f54a;
+  --color-accent-dim: #a6cf34;
+  --color-accent-ink: #0e0f11;
+  --color-rec: #ff4d4f;
+  --color-warn: #f5b84a;
+
+  --radius-ctl: 6px;
+  --radius-card: 10px;
+
+  --ease-out-quint: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  overflow: hidden;
+}
+
+input,
+textarea {
+  user-select: text;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-accent) 35%, transparent);
+}
+
+/* Thin scrollbars that match the panels. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
+}
+
+input[type="range"] {
+  accent-color: var(--color-accent);
+}
+
+video::-webkit-media-controls-panel {
+  background-image: linear-gradient(transparent, rgb(0 0 0 / 0.55));
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes pulse-rec {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes shimmer {
+  from {
+    background-position: -200% 0;
+  }
+  to {
+    background-position: 200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .anim-rise {
+    animation: rise 0.35s var(--ease-out-quint) both;
+  }
+  .anim-rec {
+    animation: pulse-rec 1.4s ease-in-out infinite;
+  }
+  .skeleton {
+    background-image: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.035), transparent);
+    background-size: 200% 100%;
+    animation: shimmer 1.6s linear infinite;
+  }
+}

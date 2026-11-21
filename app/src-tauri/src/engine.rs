@@ -365,10 +365,9 @@ fn read_events(
 /// `bettr-engine.exe` next to the app, or (during development) in the release build folder.
 pub fn find_exe() -> Option<PathBuf> {
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    [
-        dir.join("bettr-engine.exe"),
-        dir.join("..").join("release").join("bettr-engine.exe"),
-    ]
-    .into_iter()
-    .find(|p| p.is_file())
+    let beside = dir.join("bettr-engine.exe");
+    let release = dir.join("..").join("release").join("bettr-engine.exe");
+    // A debug engine is far too slow to judge capture by; dev builds of the app prefer release.
+    let order = if cfg!(debug_assertions) { [release, beside] } else { [beside, release] };
+    order.into_iter().find(|p| p.is_file())
 }

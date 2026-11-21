@@ -11,7 +11,8 @@ use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+    GWL_STYLE, GetForegroundWindow, GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsZoomed,
+    WS_CAPTION,
 };
 use windows::core::PWSTR;
 
@@ -71,6 +72,23 @@ const NOT_GAMES: &[&str] = &[
     "opera_gx.exe",
     "brave.exe",
     "vivaldi.exe",
+    "zen.exe",
+    "arc.exe",
+    "floorp.exe",
+    "librewolf.exe",
+    "waterfox.exe",
+    "thorium.exe",
+    "iexplore.exe",
+    "msedgewebview2.exe",
+    "netflix.exe",
+    "potplayermini64.exe",
+    "teams.exe",
+    "ms-teams.exe",
+    "slack.exe",
+    "steelseriesgg.exe",
+    "nvidia app.exe",
+    "nvcontainer.exe",
+    "medal.exe",
     "vlc.exe",
     "mpc-hc64.exe",
     "mpv.exe",
@@ -168,8 +186,13 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// Borderless or exclusive fullscreen: no title bar, not maximized, covering its monitor.
+/// (A maximized window also overhangs the monitor by its borders, so that alone means nothing.)
 fn covers_monitor(hwnd: HWND) -> bool {
     unsafe {
+        if IsZoomed(hwnd).as_bool() || (GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_CAPTION.0) == WS_CAPTION.0 {
+            return false;
+        }
         let mut r = RECT::default();
         if GetWindowRect(hwnd, &mut r).is_err() {
             return false;
@@ -258,6 +281,7 @@ mod tests {
         assert_eq!(classify(r"C:\Riot Games\Riot Client\UX\Something.exe", false, ""), None);
         assert_eq!(classify(r"C:\Program Files\Google\Chrome\Application\chrome.exe", true, "YouTube"), None);
         assert_eq!(classify(r"C:\Windows\System32\mmc.exe", true, "Console"), None);
+        assert_eq!(classify(r"C:\Program Files\Zen Browser\zen.exe", true, "YouTube"), None);
         assert_eq!(classify(r"C:\Tools\notepad++.exe", false, "notes"), None);
     }
 
