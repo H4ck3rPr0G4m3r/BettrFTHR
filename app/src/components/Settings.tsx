@@ -1,9 +1,10 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Microphone, Plus, SpeakerHigh, Trash, Warning } from "@phosphor-icons/react";
+import { Microphone, Play, Plus, SpeakerHigh, Trash, Warning } from "@phosphor-icons/react";
 import { api, errorText, type AudioDevice, type AudioSource, type Settings as S, type SourceKind } from "../lib/api";
 import { useApp } from "../lib/store";
 import { captureHotkey } from "../lib/hotkey";
+import { PANEL, SIDEBAR, useLayout } from "../lib/layout";
 import { TopBar } from "./TopBar";
 import { Button, Combo, IconButton, Row, Segmented, Toggle, cx } from "./ui";
 
@@ -61,7 +62,7 @@ export function Settings() {
   const info = engine?.info;
 
   return (
-    <div className="flex min-w-0 flex-1 flex-col">
+    <div className="relative flex min-w-0 flex-1 flex-col">
       <TopBar title={<h1 className="text-[17px] font-semibold tracking-tight">Settings</h1>} search={false} />
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-[760px] px-8 pt-6 pb-32">
@@ -172,6 +173,10 @@ export function Settings() {
             </Row>
           </Section>
 
+          <SoundSection draft={draft} set={set} />
+
+          <AppearanceSection />
+
           <Section title="Behavior">
             <Row title="Detect games" help="Files clips under the game you're playing and names them after it.">
               <Toggle label="Detect games" checked={draft.game_detection} onChange={(v) => set("game_detection", v)} />
@@ -200,9 +205,6 @@ export function Settings() {
                 checked={draft.start_with_windows}
                 onChange={(v) => set("start_with_windows", v)}
               />
-            </Row>
-            <Row title="Sound on save" help="A short chime when a clip or recording is saved.">
-              <Toggle label="Sound on save" checked={draft.save_sound} onChange={(v) => set("save_sound", v)} />
             </Row>
             <Row title="Keep running in the tray" help="Closing the window keeps clipping in the background.">
               <Toggle
@@ -233,7 +235,7 @@ export function Settings() {
 
       <div
         className={cx(
-          "pointer-events-none absolute inset-x-0 bottom-0 flex justify-center pb-5 pl-[248px] transition-[opacity,transform] duration-300",
+          "pointer-events-none absolute inset-x-0 bottom-0 flex justify-center pb-5 transition-[opacity,transform] duration-300",
           dirty ? "translate-y-0 opacity-100" : "translate-y-3 opacity-0",
         )}
       >
@@ -250,6 +252,103 @@ export function Settings() {
         </div>
       </div>
     </div>
+  );
+}
+
+const SOUNDS: { value: S["sound_style"]; label: string }[] = [
+  { value: "glass", label: "Glass" },
+  { value: "pop", label: "Pop" },
+  { value: "shutter", label: "Shutter" },
+  { value: "rise", label: "Rise" },
+  { value: "tick", label: "Tick" },
+];
+
+function SoundSection({ draft, set }: { draft: S; set: <K extends keyof S>(k: K, v: S[K]) => void }) {
+  const preview = (style: S["sound_style"], volume = draft.sound_volume) => void api.previewSound(style, volume);
+  return (
+    <Section title="Sounds">
+      <Row title="Play a sound on save" help="When a clip is saved and when a recording starts or stops.">
+        <Toggle label="Play a sound on save" checked={draft.save_sound} onChange={(v) => set("save_sound", v)} />
+      </Row>
+      <div className={cx("py-3.5", !draft.save_sound && "pointer-events-none opacity-40")}>
+        <div className="text-[14px]">Clip saved sound</div>
+        <div className="mt-0.5 text-[12.5px] text-faint">Click one to hear it.</div>
+        <div className="mt-3 grid grid-cols-5 gap-2" role="radiogroup" aria-label="Clip saved sound">
+          {SOUNDS.map((s) => {
+            const on = draft.sound_style === s.value;
+            return (
+              <button
+                key={s.value}
+                role="radio"
+                aria-checked={on}
+                onClick={() => {
+                  set("sound_style", s.value);
+                  preview(s.value);
+                }}
+                className={cx(
+                  "flex h-11 items-center justify-center gap-2 rounded-ctl border text-[13px] transition-colors",
+                  on ? "border-accent bg-accent/10 text-fg" : "border-line bg-raised text-muted hover:border-line-strong hover:text-fg",
+                )}
+              >
+                <Play size={13} weight="fill" className={on ? "text-accent" : "text-faint"} />
+                {s.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <Row title="Volume">
+        <label className={cx("flex items-center gap-3", !draft.save_sound && "pointer-events-none opacity-40")}>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.05}
+            value={draft.sound_volume}
+            onChange={(e) => set("sound_volume", Number(e.target.value))}
+            onPointerUp={(e) => preview(draft.sound_style, Number((e.target as HTMLInputElement).value))}
+            onKeyUp={(e) => preview(draft.sound_style, Number((e.target as HTMLInputElement).value))}
+            aria-label="Sound volume"
+            className="w-40"
+          />
+          <span className="w-10 text-right font-mono text-[12px] text-muted">{Math.round(draft.sound_volume * 100)}%</span>
+        </label>
+      </Row>
+    </Section>
+  );
+}
+
+function AppearanceSection() {
+  const { sidebar, panel, setSidebar, setPanel, reset } = useLayout();
+  const slider = (value: number, range: { min: number; max: number }, onChange: (v: number) => void, label: string) => (
+    <label className="flex items-center gap-3">
+      <input
+        type="range"
+        min={range.min}
+        max={range.max}
+        step={4}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        aria-label={label}
+        className="w-40"
+      />
+      <span className="w-14 text-right font-mono text-[12px] text-muted">{value} px</span>
+    </label>
+  );
+  return (
+    <Section title="Layout">
+      <Row title="Sidebar width" help="You can also drag the sidebar's edge.">
+        {slider(sidebar, SIDEBAR, setSidebar, "Sidebar width")}
+      </Row>
+      <Row title="Clip panel width" help="The panel next to the player. Drag its edge in the clip view.">
+        {slider(panel, PANEL, setPanel, "Clip panel width")}
+      </Row>
+      <Row title="Reset layout">
+        <Button size="sm" variant="ghost" onClick={reset} disabled={sidebar === SIDEBAR.default && panel === PANEL.default}>
+          Reset
+        </Button>
+      </Row>
+    </Section>
   );
 }
 

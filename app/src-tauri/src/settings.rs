@@ -76,6 +76,9 @@ pub struct Settings {
     pub discord_limit_mb: u32,
     /// Launch hidden in the tray when Windows starts.
     pub start_with_windows: bool,
+    pub sound_style: crate::sound::Style,
+    /// 0..1
+    pub sound_volume: f32,
 }
 
 impl Default for Settings {
@@ -110,6 +113,8 @@ impl Default for Settings {
             close_to_tray: true,
             discord_limit_mb: 10,
             start_with_windows: true,
+            sound_style: crate::sound::Style::Rise,
+            sound_volume: 0.7,
         }
     }
 }
@@ -156,6 +161,7 @@ impl Settings {
         }
         self.audio.truncate(8);
         self.discord_limit_mb = self.discord_limit_mb.clamp(1, 2000);
+        self.sound_volume = self.sound_volume.clamp(0.0, 1.0);
         for a in &mut self.audio {
             a.gain = a.gain.clamp(0.0, 4.0);
         }

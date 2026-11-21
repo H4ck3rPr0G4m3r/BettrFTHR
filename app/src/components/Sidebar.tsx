@@ -4,6 +4,8 @@ import { useApp, type Filter } from "../lib/store";
 import { api, errorText } from "../lib/api";
 import { formatDuration } from "../lib/format";
 import { Button, Combo, GameTile, cx } from "./ui";
+import { ResizeHandle } from "./ResizeHandle";
+import { SIDEBAR, useLayout } from "../lib/layout";
 
 function NavItem({
   active,
@@ -58,9 +60,18 @@ export function Sidebar() {
   const current: Filter | null = view.page === "settings" ? null : view.filter;
   const go = (filter: Filter) => setView({ page: "library", filter });
   const recordings = clips.filter((c) => c.kind === "recording").length;
+  const width = useLayout((s) => s.sidebar);
+  const setWidth = useLayout((s) => s.setSidebar);
 
   return (
-    <aside className="flex w-[248px] shrink-0 flex-col border-r border-line bg-panel">
+    <aside className="relative flex shrink-0 flex-col border-r border-line bg-panel" style={{ width }}>
+      <ResizeHandle
+        edge="right"
+        width={width}
+        onWidth={setWidth}
+        onReset={() => setWidth(SIDEBAR.default)}
+        label="Resize sidebar"
+      />
       <div data-tauri-drag-region className="flex h-14 shrink-0 items-center gap-2.5 px-5">
         <img src="/logo.png" alt="" className="pointer-events-none size-6" draggable={false} />
         <span className="pointer-events-none text-[15px] font-semibold tracking-tight">
