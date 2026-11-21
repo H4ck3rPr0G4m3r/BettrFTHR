@@ -291,6 +291,11 @@ fn build_moov(
         }
         if fragmented {
             w.boxed(b"mvex", |w| {
+                // Placeholder that `finish` turns into an `mehd` (total duration). Until then
+                // (or after a crash) it is an ignorable `free` box.
+                w.u32(16);
+                w.bytes(b"free");
+                w.zeros(8);
                 for id in 1..=audio.len() as u32 + 1 {
                     w.full(b"trex", 0, 0, |w| {
                         w.u32(id);
@@ -505,6 +510,8 @@ pub struct FragmentedWriter {
     bytes: u64,
     video_frames: usize,
     video_end: u64,
+    /// File offset of the 16-byte placeholder that becomes `mehd` on finish.
+    mehd_at: Option<u64>,
 }
 
 fn empty_table() -> SampleTable {
@@ -536,6 +543,14 @@ impl FragmentedWriter {
         });
         let ats: Vec<SampleTable> = audio.iter().map(|_| empty_table()).collect();
         let moov = build_moov(video, &empty_table(), audio, &ats, 0, true);
+        let mehd_at = moov
+            .windows(4)
+            .position(|b| b == b"mvex")
+            .and_then(|m| {
+                let pat = [0, 0, 0, 16, b'f', b'r', b'e', b'e'];
+                moov[m..].windows(8).position(|b| b == pat).map(|i| m + i)
+            })
+            .map(|i| (ftyp.0.len() + i) as u64);
         file.write_all(&ftyp.0)?;
         file.write_all(&moov)?;
         file.flush()?;
@@ -548,6 +563,7 @@ impl FragmentedWriter {
             bytes: (ftyp.0.len() + moov.len()) as u64,
             video_frames: 0,
             video_end: 0,
+            mehd_at,
         })
     }
 
@@ -639,7 +655,18 @@ impl FragmentedWriter {
 
     pub fn finish(mut self) -> Result<MuxStats> {
         self.file.flush()?;
-        let f = self.file.into_inner().map_err(|e| e.into_error())?;
+        let mut f = self.file.into_inner().map_err(|e| e.into_error())?;
+        if let Some(at) = self.mehd_at {
+            use std::io::{Seek, SeekFrom};
+            let dur = to_movie(self.video_end, VIDEO_TIMESCALE);
+            let mut mehd = Vec::with_capacity(16);
+            mehd.extend_from_slice(&16u32.to_be_bytes());
+            mehd.extend_from_slice(b"mehd");
+            mehd.extend_from_slice(&0u32.to_be_bytes());
+            mehd.extend_from_slice(&dur.to_be_bytes());
+            f.seek(SeekFrom::Start(at))?;
+            f.write_all(&mehd)?;
+        }
         f.sync_all()?;
         Ok(MuxStats {
             duration_hns: self.video_end as i64 * 10_000_000 / VIDEO_TIMESCALE as i64,
