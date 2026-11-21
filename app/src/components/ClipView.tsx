@@ -27,6 +27,8 @@ import { filterClips } from "./Library";
 import { Player, type PlayerHandle } from "./Player";
 import { TopBar } from "./TopBar";
 import { Button, GameTile, IconButton, cx } from "./ui";
+import { ResizeHandle } from "./ResizeHandle";
+import { PANEL, useLayout } from "../lib/layout";
 
 export function ClipView({ path, filter }: { path: string; filter: Filter }) {
   const clips = useApp((s) => s.clips);
@@ -51,6 +53,9 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [res, setRes] = useState<string | null>(null);
   const player = useRef<PlayerHandle>(null);
+  const panel = useLayout((s) => s.panel);
+  const setPanel = useLayout((s) => s.setPanel);
+  const sidebar = useLayout((s) => s.sidebar);
   const [editing, setEditing] = useState(false);
   const [probe, setProbe] = useState<Probe | null>(null);
   const [edit, setEdit] = useState<EditState | null>(null);
@@ -324,7 +329,19 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
             ))}
         </div>
 
-        <aside className="flex w-[320px] shrink-0 flex-col overflow-y-auto border-l border-line bg-panel max-[1150px]:w-[280px]">
+        <aside
+          className="relative flex shrink-0 flex-col border-l border-line bg-panel"
+          // The player keeps at least 380 px; on a narrow window the panel gives way.
+          style={{ width: `max(${PANEL.min}px, min(${panel}px, calc(100vw - ${sidebar}px - 380px)))` }}
+        >
+          <ResizeHandle
+            edge="left"
+            width={panel}
+            onWidth={setPanel}
+            onReset={() => setPanel(PANEL.default)}
+            label="Resize clip panel"
+          />
+          <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
           {editing ? (
             probe && edit ? (
               <EditPanel
@@ -425,6 +442,7 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
           </div>
           </>
           )}
+          </div>
         </aside>
       </div>
 

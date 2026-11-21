@@ -34,6 +34,9 @@ html,
 body,
 #root {
   height: 100%;
+  /* clip, not hidden: scrollIntoView and focus can still scroll a "hidden" box, which
+     shifted the whole window up and cut off the title bar. */
+  overflow: clip;
 }
 
 body {
@@ -44,7 +47,6 @@ body {
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
   user-select: none;
-  overflow: hidden;
 }
 
 input,

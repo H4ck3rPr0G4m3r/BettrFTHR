@@ -175,6 +175,12 @@ fn open_clip_folder(app: AppHandle, state: State<AppState>) -> Res<()> {
     app.opener().open_path(dir.to_string_lossy(), None::<&str>).map_err(err)
 }
 
+/// Plays a save sound so it can be picked in Settings.
+#[tauri::command]
+fn preview_sound(style: sound::Style, volume: f32) {
+    sound::play(sound::Cue::Saved, style, volume);
+}
+
 /// The folder with engine.log (for bug reports).
 #[tauri::command]
 fn open_logs(app: AppHandle) -> Res<()> {
@@ -411,12 +417,18 @@ fn main() {
                         return;
                     };
                     let kind = v.get("event").and_then(|e| e.as_str()).unwrap_or_default();
-                    let on = h.state::<AppState>().settings.lock().save_sound;
-                    match kind {
-                        "clip_saved" if on => sound::play(sound::Cue::Saved),
-                        "recording_started" if on => sound::play(sound::Cue::RecordStart),
-                        "recording_stopped" if on => sound::play(sound::Cue::RecordStop),
-                        _ => {}
+                    let (on, style, volume) = {
+                        let s = h.state::<AppState>().settings.lock().clone();
+                        (s.save_sound, s.sound_style, s.sound_volume)
+                    };
+                    let cue = match kind {
+                        "clip_saved" => sound::Cue::Saved,
+                        "recording_started" => sound::Cue::RecordStart,
+                        "recording_stopped" => sound::Cue::RecordStop,
+                        _ => return,
+                    };
+                    if on {
+                        sound::play(cue, style, volume);
                     }
                 });
             }
@@ -460,6 +472,7 @@ fn main() {
             open_clip_folder,
             reveal_clip,
             open_logs,
+            preview_sound,
             app_version,
             copy_clip,
             probe_clip,

@@ -28,6 +28,9 @@ export interface Settings {
   /** Discord upload limit in MB; Discord copies are compressed to fit. */
   discord_limit_mb: number;
   start_with_windows: boolean;
+  sound_style: "glass" | "pop" | "shutter" | "rise" | "tick";
+  /** 0..1 */
+  sound_volume: number;
 }
 
 export type Phase = "idle" | "starting" | "running" | "crashed" | "missing";
@@ -128,6 +131,7 @@ export const api = {
   openClipFolder: () => invoke<void>("open_clip_folder"),
   revealClip: (path: string) => invoke<void>("reveal_clip", { path }),
   openLogs: () => invoke<void>("open_logs"),
+  previewSound: (style: Settings["sound_style"], volume: number) => invoke<void>("preview_sound", { style, volume }),
   appVersion: () => invoke<string>("app_version"),
   copyClip: (path: string) => invoke<void>("copy_clip", { path }),
   listAudioDevices: () => invoke<AudioDevice[]>("list_audio_devices"),
