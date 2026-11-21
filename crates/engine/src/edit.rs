@@ -12,6 +12,7 @@ use crate::clock::HNS_PER_SEC;
 use crate::demux::{Kind, Mp4, Sample};
 use crate::mp4::{self, AAC_FRAME};
 use crate::ring::Packet;
+use crate::transcode;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -198,6 +199,9 @@ pub struct ExportJob {
     /// Keep the per-source tracks (for editing again). Discord copies leave them out.
     #[serde(default = "yes")]
     pub keep_sources: bool,
+    /// Upload limit: if the lossless cut is bigger, re-encode to fit (frame-accurate).
+    #[serde(default)]
+    pub fit_bytes: Option<u64>,
 }
 
 fn yes() -> bool {
@@ -210,6 +214,8 @@ pub struct ExportResult {
     pub start: f64,
     pub seconds: f64,
     pub bytes: u64,
+    /// Set when the clip was re-encoded to fit the limit.
+    pub reencoded: Option<transcode::Plan>,
 }
 
 /// Volume at clip time `t` for one source: gain, faded to zero inside muted sections.
@@ -274,8 +280,10 @@ pub fn export(job: &ExportJob, progress: &mut dyn FnMut(&str, f64)) -> Result<Ex
     let v = &m.tracks[vi];
     let ts = v.timescale as u64;
     let secs = |pts: u64| pts as f64 / ts as f64;
+    let src_duration = v.duration_secs();
+    let src_fps = (v.samples.len() as f64 / src_duration.max(0.001)).round().max(1.0) as u32;
 
-    // Video: from the keyframe at or before the start (lossless cut) to the end.
+    // Lossless selection: from the keyframe at or before the start to the end.
     let start_idx = v
         .samples
         .iter()
@@ -290,24 +298,35 @@ pub fn export(job: &ExportJob, progress: &mut dyn FnMut(&str, f64)) -> Result<Ex
     let sel: Vec<Sample> = v.samples[start_idx..=end_idx].to_vec();
     let base = sel[0].pts;
     let last = sel[sel.len() - 1];
-    let t0 = secs(base);
-    let t1 = secs(last.pts + last.duration as u64);
-    let to_hns = |d: u64| (d as i128 * HNS_PER_SEC as i128 / ts as i128) as i64;
-    let vpackets: Vec<Packet> = sel
-        .iter()
-        .map(|s| Packet {
-            pts: to_hns(s.pts - base),
-            duration: to_hns(s.duration as u64),
-            key: s.key,
-            data: Arc::from(Vec::new()),
-        })
-        .collect();
-    let sizes: Vec<u32> = sel.iter().map(|s| s.size).collect();
-    let fps = (v.samples.len() as f64 / v.duration_secs().max(0.001)).round().max(1.0) as u32;
     let (width, height, sps, pps) = (v.width, v.height, v.sps.clone(), v.pps.clone());
 
-    // Audio: decode every source, apply volume and mutes, mix, re-encode.
     let (_, sources) = layout(&m);
+    let keep = job.keep_sources && sources.len() > 1;
+    let audio_tracks = if sources.is_empty() { 0 } else { 1 + if keep { sources.len() } else { 0 } };
+
+    // Too big for the upload limit as a lossless cut? Then re-encode, frame-accurately.
+    let lossless_bytes: u64 = sel.iter().map(|s| s.size as u64).sum::<u64>()
+        + (secs(last.pts + last.duration as u64) - secs(base)) as u64 * 24_000 * audio_tracks as u64;
+    let reencode = job.fit_bytes.is_some_and(|limit| lossless_bytes > limit);
+    let audio_kbps = (audio::AAC_BYTES_PER_SEC * 8 / 1000) * audio_tracks as u32;
+    let mut plan = match (reencode, job.fit_bytes) {
+        (true, Some(limit)) => {
+            let len = job.end.min(src_duration) - job.start.max(0.0);
+            Some(transcode::plan(limit, len, audio_kbps, width, height, src_fps)?)
+        }
+        _ => None,
+    };
+    let (t0, t1) = if let Some(p) = &plan {
+        // Whole output frames, so audio and video end together.
+        let t0 = job.start.max(0.0);
+        let frames = ((job.end.min(src_duration) - t0) * p.fps as f64).round().max(1.0);
+        (t0, t0 + frames / p.fps as f64)
+    } else {
+        (secs(base), secs(last.pts + last.duration as u64))
+    };
+    let audio_share = if reencode { 0.15 } else { 0.5 };
+
+    // Audio: decode every source, apply volume and mutes, mix, re-encode.
     let names: Vec<String> = sources.iter().map(|&i| m.tracks[i].name.clone()).collect();
     let f0 = (t0 * RATE as f64).round() as u64;
     let total = ((t1 - t0) * RATE as f64).round() as u64;
@@ -316,13 +335,11 @@ pub fn export(job: &ExportJob, progress: &mut dyn FnMut(&str, f64)) -> Result<Ex
         .collect();
     let mut streams = sources.iter().map(|&ti| Stream::open(&m, ti, f0)).collect::<Result<Vec<_>>>()?;
     let mut mix_enc = if sources.is_empty() { None } else { Some(Encoded::new()?) };
-    let keep = job.keep_sources && sources.len() > 1;
     let mut src_enc = if keep {
         (0..sources.len()).map(|_| Encoded::new()).collect::<Result<Vec<_>>>()?
     } else {
         Vec::new()
     };
-
     let chunk = RATE as usize;
     let mut done = 0u64;
     while done < total {
@@ -350,9 +367,8 @@ pub fn export(job: &ExportJob, progress: &mut dyn FnMut(&str, f64)) -> Result<Ex
             e.push(&mix)?;
         }
         done += n as u64;
-        progress("audio", 0.5 * done as f64 / total.max(1) as f64);
+        progress("audio", audio_share * done as f64 / total.max(1) as f64);
     }
-
     let mix_packets = match mix_enc {
         Some(e) => e.finish(total)?,
         None => Vec::new(),
@@ -377,36 +393,79 @@ pub fn export(job: &ExportJob, progress: &mut dyn FnMut(&str, f64)) -> Result<Ex
             packets,
         });
     }
-
     if let Some(dir) = job.output.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let count = sel.len();
-    let mut fetch = |i: usize| -> Result<Vec<u8>> {
-        progress("video", 0.5 + 0.5 * i as f64 / count as f64);
-        m.read(&sel[i])
+
+    let (stats, plan) = if let (Some(mut plan), Some(limit)) = (plan.take(), job.fit_bytes) {
+        let mut attempt = 0;
+        loop {
+            let enc = transcode::video(&job.input, t0, t1, &plan, &mut |p| progress("video", 0.15 + 0.8 * p))?;
+            let stats = mp4::write_mp4(
+                &job.output,
+                &mp4::VideoTrack {
+                    width: plan.width,
+                    height: plan.height,
+                    fps: plan.fps,
+                    sps: &enc.sps,
+                    pps: &enc.pps,
+                    packets: &enc.packets,
+                },
+                &tracks,
+            )?;
+            attempt += 1;
+            if stats.bytes <= limit || attempt >= 3 {
+                if stats.bytes > limit {
+                    bail!("could not get the clip under {} MB; trim it shorter", limit / 1024 / 1024);
+                }
+                break (stats, Some(plan));
+            }
+            // Rate control overshot: aim lower by the overshoot plus a margin, and retry.
+            let scale = limit as f64 / stats.bytes as f64 * 0.95;
+            tracing::warn!(bytes = stats.bytes, limit, scale, "export over the limit, retrying");
+            plan.video_kbps = ((plan.video_kbps as f64) * scale) as u32;
+        }
+    } else {
+        let to_hns = |d: u64| (d as i128 * HNS_PER_SEC as i128 / ts as i128) as i64;
+        let vpackets: Vec<Packet> = sel
+            .iter()
+            .map(|s| Packet {
+                pts: to_hns(s.pts - base),
+                duration: to_hns(s.duration as u64),
+                key: s.key,
+                data: Arc::from(Vec::new()),
+            })
+            .collect();
+        let sizes: Vec<u32> = sel.iter().map(|s| s.size).collect();
+        let count = sel.len();
+        let mut fetch = |i: usize| -> Result<Vec<u8>> {
+            progress("video", 0.5 + 0.5 * i as f64 / count as f64);
+            m.read(&sel[i])
+        };
+        let stats = mp4::write_mp4_with(
+            &job.output,
+            &mp4::VideoTrack {
+                width,
+                height,
+                fps: src_fps,
+                sps: &sps,
+                pps: &pps,
+                packets: &vpackets,
+            },
+            Some(mp4::VideoSource {
+                sizes: &sizes,
+                fetch: &mut fetch,
+            }),
+            &tracks,
+        )?;
+        (stats, None)
     };
-    let stats = mp4::write_mp4_with(
-        &job.output,
-        &mp4::VideoTrack {
-            width,
-            height,
-            fps,
-            sps: &sps,
-            pps: &pps,
-            packets: &vpackets,
-        },
-        Some(mp4::VideoSource {
-            sizes: &sizes,
-            fetch: &mut fetch,
-        }),
-        &tracks,
-    )?;
     Ok(ExportResult {
         path: job.output.clone(),
         start: t0,
         seconds: stats.duration_hns as f64 / HNS_PER_SEC as f64,
         bytes: stats.bytes,
+        reencoded: plan,
     })
 }
 

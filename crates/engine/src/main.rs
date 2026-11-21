@@ -17,6 +17,7 @@ mod hotkey;
 mod mp4;
 mod pipeline;
 mod recording;
+mod transcode;
 mod ring;
 
 use anyhow::{Context, Result};

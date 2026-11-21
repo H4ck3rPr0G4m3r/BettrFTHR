@@ -32,7 +32,7 @@ pub const CHANNELS: u16 = 2;
 const PAD_LAG_HNS: i64 = 1_000_000; // 100 ms
 /// Timestamp jitter absorbed before inserting silence / dropping samples.
 const TOLERANCE_FRAMES: i64 = 480; // 10 ms
-const AAC_BYTES_PER_SEC: u32 = 24_000; // 192 kbps
+pub const AAC_BYTES_PER_SEC: u32 = 24_000; // 192 kbps
 
 /// Encoder delay of the Microsoft AAC encoder in samples: output packet `i` decodes to the
 /// input samples starting at `i * 1024 - AAC_DELAY`. Measured with `--selftest-aac`: the
