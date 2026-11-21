@@ -15,15 +15,19 @@ with a Rust capture engine and a focus on stability over features. See
   precise timeline and a filmstrip of the other clips, editor (trim, mute or turn down each
   audio source, mute sections), copy for Discord that compresses to your upload limit,
   settings (length, fps, resolution, quality, hotkeys incl. F13-F24, audio sources),
-  game detection, tray. Installer and autostart are next.
+  game detection, tray, installer, start with Windows.
 
 ## Running the app
 
 ```sh
-cargo build --release -p bettr-engine      # the app runs this binary
-cd app && npm install && npx tauri dev     # development
-cd app && npx tauri build                  # app build (installer packaging of the engine: M7)
+cd app && npm install
+npx tauri dev      # development (builds the engine first)
+npx tauri build    # installer: target/release/bundle/nsis/BettrFTHR_<version>_x64-setup.exe
 ```
+
+The installer is per-user (no admin prompt) and bundles the engine next to the app. An
+installed copy starts with Windows, hidden in the tray (Settings > Behavior); development
+builds never register themselves.
 
 Settings live in `%APPDATA%\dev.bettrfthr.app\settings.json`, the engine log in
 `%LOCALAPPDATA%\dev.bettrfthr.app\engine.log`. Clips default to `Videos\BettrFTHR`, one

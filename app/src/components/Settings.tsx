@@ -190,6 +190,13 @@ export function Settings() {
                 onChange={(v) => set("buffer_mode", v)}
               />
             </Row>
+            <Row title="Start with Windows" help="Starts hidden in the tray, so clipping works right after you log in.">
+              <Toggle
+                label="Start with Windows"
+                checked={draft.start_with_windows}
+                onChange={(v) => set("start_with_windows", v)}
+              />
+            </Row>
             <Row title="Sound on save" help="A short chime when a clip or recording is saved.">
               <Toggle label="Sound on save" checked={draft.save_sound} onChange={(v) => set("save_sound", v)} />
             </Row>

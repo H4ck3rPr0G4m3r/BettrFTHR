@@ -27,6 +27,7 @@ export interface Settings {
   close_to_tray: boolean;
   /** Discord upload limit in MB; Discord copies are compressed to fit. */
   discord_limit_mb: number;
+  start_with_windows: boolean;
 }
 
 export type Phase = "idle" | "starting" | "running" | "crashed" | "missing";
