@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use audio::{AudioConfig, AudioEngine, SourceKind, SourceSpec};
 use pipeline::{VideoConfig, VideoPipeline};
 use serde_json::json;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFStartup};
@@ -165,46 +165,123 @@ fn parse_args() -> Result<Args> {
     Ok(a)
 }
 
+/// Human-readable device list (stderr when stdout carries the JSON protocol).
+fn print_devices(devices: &[audio::DeviceInfo]) {
+    for kind in [SourceKind::Output, SourceKind::Input] {
+        eprintln!(
+            "{}:",
+            if kind == SourceKind::Output {
+                "Outputs (use with --output)"
+            } else {
+                "Inputs (use with --input)"
+            }
+        );
+        for d in devices.iter().filter(|d| d.kind == kind) {
+            eprintln!("  {} {}", if d.default { "*" } else { " " }, d.name);
+        }
+    }
+    eprintln!("  (* = Windows default; pass part of a name, e.g. --input \"Shure\")");
+}
+
 fn emit(v: serde_json::Value) {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{v}");
     let _ = out.flush();
 }
 
+#[derive(Debug, PartialEq)]
 enum Command {
-    Save,
+    /// Save the last N seconds (default: the whole replay buffer).
+    Save(Option<u32>),
     RecordStart,
     RecordStop,
     RecordToggle,
     Status,
     ListAudio,
+    /// The game in the foreground (from the app's detector); names and groups files.
+    SetGame(Option<String>),
+    Help,
     Quit,
+    Unknown(String),
 }
 
+const HELP: &str = "commands: save [seconds], record, record_start, record_stop, status, list_audio, \
+                    set_game <name>, help, quit";
+
+/// Accepts `{"cmd":"save","seconds":15}` from the app, and forgiving plain text from a human:
+/// `save 15`, `list-audio`, `--list-audio`, `Status`.
 fn parse_command(line: &str) -> Option<Command> {
     let line = line.trim();
-    let name = if line.starts_with('{') {
-        serde_json::from_str::<serde_json::Value>(line)
-            .ok()?
-            .get("cmd")?
-            .as_str()?
-            .to_owned()
-    } else {
-        line.to_owned()
-    };
-    match name.as_str() {
-        "save" => Some(Command::Save),
-        "record_start" => Some(Command::RecordStart),
-        "record_stop" => Some(Command::RecordStop),
-        "record_toggle" => Some(Command::RecordToggle),
-        "status" => Some(Command::Status),
-        "list_audio" => Some(Command::ListAudio),
-        "quit" | "exit" => Some(Command::Quit),
-        _ => None,
+    if line.is_empty() {
+        return None;
     }
+    let (name, arg) = if line.starts_with('{') {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return Some(Command::Unknown(line.to_owned()));
+        };
+        let name = v.get("cmd").and_then(|c| c.as_str()).unwrap_or_default().to_owned();
+        let arg = ["seconds", "game"]
+            .iter()
+            .find_map(|k| v.get(*k))
+            .map(|a| a.as_str().map(str::to_owned).unwrap_or_else(|| a.to_string()));
+        (name, arg)
+    } else {
+        let (n, a) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let a = a.trim().trim_matches('"');
+        (n.to_owned(), (!a.is_empty()).then(|| a.to_owned()))
+    };
+    let norm = name.trim_start_matches('-').to_ascii_lowercase().replace('-', "_");
+    Some(match norm.as_str() {
+        "save" | "clip" => match arg.as_deref().map(str::parse::<u32>) {
+            None => Command::Save(None),
+            Some(Ok(s)) if s > 0 => Command::Save(Some(s)),
+            Some(_) => Command::Unknown(line.to_owned()),
+        },
+        "record" | "record_toggle" => Command::RecordToggle,
+        "record_start" => Command::RecordStart,
+        "record_stop" => Command::RecordStop,
+        "status" => Command::Status,
+        "list_audio" | "audio" | "devices" => Command::ListAudio,
+        "set_game" | "game" => Command::SetGame(arg.filter(|g| g != "null")),
+        "help" | "?" => Command::Help,
+        "quit" | "exit" => Command::Quit,
+        _ => Command::Unknown(line.to_owned()),
+    })
 }
 
-fn clip_path(dir: &Path, label: &str) -> PathBuf {
+/// A game name as a safe folder/file name component ("VALORANT", "Counter-Strike 2").
+fn sanitize(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || r#"<>:"/\|?*"#.contains(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let s = s.trim_end_matches('.').chars().take(60).collect::<String>();
+    if s.is_empty() { "Unknown".into() } else { s }
+}
+
+/// `<out>/<Game>/<Game> 2026-11-21 10-12-57.mp4`, or `<out>/Clip ….mp4` with no game.
+fn clip_path(dir: &Path, game: Option<&str>, kind: &str) -> PathBuf {
+    let (dir, label) = match game {
+        Some(g) => {
+            let g = sanitize(g);
+            (
+                dir.join(&g),
+                if kind == "Recording" {
+                    format!("{g} Recording")
+                } else {
+                    g
+                },
+            )
+        }
+        None => (dir.to_path_buf(), kind.to_owned()),
+    };
     let t = unsafe { GetLocalTime() };
     let base = format!(
         "{label} {:04}-{:02}-{:02} {:02}-{:02}-{:02}",
@@ -219,7 +296,12 @@ fn clip_path(dir: &Path, label: &str) -> PathBuf {
     p
 }
 
-fn start_recording(video: &VideoPipeline, audio: Option<&AudioEngine>, out_dir: &Path) -> Option<recording::Recorder> {
+fn start_recording(
+    video: &VideoPipeline,
+    audio: Option<&AudioEngine>,
+    out_dir: &Path,
+    game: Option<&str>,
+) -> Option<recording::Recorder> {
     let src = recording::RecordingSource {
         video: video.shared.clone(),
         width: video.width,
@@ -227,9 +309,9 @@ fn start_recording(video: &VideoPipeline, audio: Option<&AudioEngine>, out_dir: 
         fps: video.fps,
         audio: audio.map(|a| a.shared.clone()),
     };
-    match recording::Recorder::start(src, clip_path(out_dir, "Recording")) {
+    match recording::Recorder::start(src, clip_path(out_dir, game, "Recording")) {
         Ok(r) => {
-            emit(json!({"event": "recording_started", "path": r.path}));
+            emit(json!({"event": "recording_started", "path": r.path, "game": game}));
             Some(r)
         }
         Err(e) => {
@@ -253,7 +335,7 @@ fn finish_recording(r: recording::Recorder, reason: &str) {
     }
 }
 
-fn save_clip(video: &VideoPipeline, audio: Option<&AudioEngine>, seconds: u32, out_dir: &Path) {
+fn save_clip(video: &VideoPipeline, audio: Option<&AudioEngine>, seconds: u32, out_dir: &Path, game: Option<String>) {
     let started = std::time::Instant::now();
     let Some(snap) = video.snapshot(seconds) else {
         emit(json!({"event": "error", "message": "nothing buffered yet"}));
@@ -274,7 +356,7 @@ fn save_clip(video: &VideoPipeline, audio: Option<&AudioEngine>, seconds: u32, o
             }
         }
         let sound = audio.map(|a| a.snapshot(start, end));
-        let path = clip_path(&dir, "Clip");
+        let path = clip_path(&dir, game.as_deref(), "Clip");
         let mut tracks = Vec::new();
         if let Some(s) = &sound {
             // Track order matters: players and Discord play the first (enabled) one.
@@ -297,7 +379,7 @@ fn save_clip(video: &VideoPipeline, audio: Option<&AudioEngine>, seconds: u32, o
             .as_ref()
             .and_then(|s| s.mix.first())
             .map(|p| (p.pts - start) as f64 / 1e4);
-        let res = std::fs::create_dir_all(&dir)
+        let res = std::fs::create_dir_all(path.parent().unwrap_or(&dir))
             .map_err(anyhow::Error::from)
             .and_then(|_| {
                 mp4::write_mp4(
@@ -330,6 +412,7 @@ fn save_clip(video: &VideoPipeline, audio: Option<&AudioEngine>, seconds: u32, o
                     "bytes": stats.bytes,
                     "frames": stats.video_frames,
                     "audio_tracks": tracks.len(),
+                    "game": game,
                 }));
             }
             Err(e) => {
@@ -357,8 +440,13 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if args.list_audio {
-        for d in audio::list_devices()? {
-            println!("{}", serde_json::to_string(&d)?);
+        let devices = audio::list_devices()?;
+        if std::io::stdout().is_terminal() {
+            print_devices(&devices);
+        } else {
+            for d in devices {
+                println!("{}", serde_json::to_string(&d)?);
+            }
         }
         return Ok(());
     }
@@ -410,7 +498,11 @@ fn main() -> Result<()> {
         let tx = cmd_tx.clone();
         std::thread::spawn(move || {
             for id in hk_rx {
-                let _ = tx.send(if id == 1 { Command::Save } else { Command::RecordToggle });
+                let _ = tx.send(if id == 1 {
+                    Command::Save(None)
+                } else {
+                    Command::RecordToggle
+                });
             }
         });
     }
@@ -420,6 +512,14 @@ fn main() -> Result<()> {
     let mut last_progress = std::time::Instant::now();
     let mut restarts = 0u32;
     let mut recorder: Option<recording::Recorder> = None;
+    let mut game: Option<String> = None;
+    let human = std::io::stdin().is_terminal();
+    if human {
+        eprintln!(
+            "bettr-engine running. {} saves a clip, {} toggles recording. Type `help` for commands.",
+            args.save_key, args.record_key
+        );
+    }
     loop {
         let cmd = cmd_rx.recv_timeout(std::time::Duration::from_secs(1));
         let cmd = match cmd {
@@ -428,9 +528,13 @@ fn main() -> Result<()> {
             other => other,
         };
         match cmd {
-            Ok(Command::Save) => save_clip(&video, audio.as_ref(), args.video.replay_seconds, &args.out_dir),
+            Ok(Command::Save(seconds)) => {
+                let max = args.video.replay_seconds;
+                let secs = seconds.map_or(max, |s| s.min(max));
+                save_clip(&video, audio.as_ref(), secs, &args.out_dir, game.clone());
+            }
             Ok(Command::RecordStart) if recorder.is_none() => {
-                recorder = start_recording(&video, audio.as_ref(), &args.out_dir);
+                recorder = start_recording(&video, audio.as_ref(), &args.out_dir, game.as_deref());
             }
             Ok(Command::RecordStop) => {
                 if let Some(r) = recorder.take() {
@@ -439,7 +543,12 @@ fn main() -> Result<()> {
             }
             Ok(Command::RecordStart | Command::RecordToggle) => {}
             Ok(Command::ListAudio) => match audio::list_devices() {
-                Ok(devices) => emit(json!({"event": "audio_devices", "devices": devices})),
+                Ok(devices) => {
+                    if human {
+                        print_devices(&devices);
+                    }
+                    emit(json!({"event": "audio_devices", "devices": devices}));
+                }
                 Err(e) => emit(json!({"event": "error", "message": format!("list audio devices: {e:#}")})),
             },
             Ok(Command::Status) => {
@@ -465,7 +574,17 @@ fn main() -> Result<()> {
                     "buffered_mb": ring.bytes() as f64 / 1048576.0,
                     "audio_sources": sources,
                     "recording": recorder.as_ref().map(|r| &r.path),
+                    "game": game,
                 }));
+            }
+            Ok(Command::SetGame(g)) => {
+                tracing::info!(game = ?g, "game changed");
+                game = g;
+                emit(json!({"event": "game", "game": game}));
+            }
+            Ok(Command::Help) => emit(json!({"event": "help", "message": HELP})),
+            Ok(Command::Unknown(line)) => {
+                emit(json!({"event": "error", "message": format!("unknown command `{line}`; {HELP}")}))
             }
             Ok(Command::Quit) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -503,7 +622,7 @@ fn main() -> Result<()> {
                     emit(json!({"event": "restarted"}));
                     if was_recording {
                         std::thread::sleep(std::time::Duration::from_millis(1500)); // first keyframe
-                        recorder = start_recording(&video, audio.as_ref(), &args.out_dir);
+                        recorder = start_recording(&video, audio.as_ref(), &args.out_dir, game.as_deref());
                     }
                 }
                 Err(e) => {
@@ -522,4 +641,53 @@ fn main() -> Result<()> {
     }
     emit(json!({"event": "stopped"}));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_are_forgiving() {
+        assert_eq!(parse_command("save"), Some(Command::Save(None)));
+        assert_eq!(parse_command("save 15"), Some(Command::Save(Some(15))));
+        assert_eq!(
+            parse_command(r#"{"cmd":"save","seconds":20}"#),
+            Some(Command::Save(Some(20)))
+        );
+        assert_eq!(parse_command("--list-audio"), Some(Command::ListAudio));
+        assert_eq!(parse_command("list-audio"), Some(Command::ListAudio));
+        assert_eq!(parse_command("Status"), Some(Command::Status));
+        assert_eq!(parse_command("record"), Some(Command::RecordToggle));
+        assert_eq!(
+            parse_command(r#"{"cmd":"set_game","game":"VALORANT"}"#),
+            Some(Command::SetGame(Some("VALORANT".into())))
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"set_game","game":null}"#),
+            Some(Command::SetGame(None))
+        );
+        assert_eq!(
+            parse_command("game Counter-Strike 2"),
+            Some(Command::SetGame(Some("Counter-Strike 2".into())))
+        );
+        assert_eq!(parse_command("save abc"), Some(Command::Unknown("save abc".into())));
+        assert_eq!(parse_command("frobnicate"), Some(Command::Unknown("frobnicate".into())));
+        assert_eq!(parse_command("   "), None);
+    }
+
+    #[test]
+    fn game_names_are_safe_paths() {
+        assert_eq!(sanitize("VALORANT"), "VALORANT");
+        assert_eq!(sanitize("a/b:c?"), "a b c");
+        assert_eq!(sanitize("..."), "Unknown");
+        let p = clip_path(Path::new("out"), Some("Counter-Strike 2"), "Recording");
+        assert!(p.starts_with(Path::new("out").join("Counter-Strike 2")));
+        assert!(
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("Counter-Strike 2 Recording ")
+        );
+    }
 }

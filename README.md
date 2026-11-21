@@ -39,8 +39,10 @@ bettr-engine --output default --input "Shure" --input "Line 1@0.7"   # several m
 bettr-engine --config settings.json                # everything from a JSON file (see main.rs)
 ```
 
-Commands can also be typed on stdin (`save`, `record_toggle`, `status`, `list_audio`, `quit`);
-events come back as JSON lines on stdout. Logs go to stderr (`RUST_LOG=debug` for more).
+While it runs you can also type commands into the console: `save` (or `save 15` for the last
+15 s), `record`, `status`, `list-audio`, `game VALORANT` (clips then go to `clips/VALORANT/`),
+`help`, `quit`. The app sends the same commands as JSON lines (`{"cmd":"save","seconds":15}`)
+and reads events back as JSON lines on stdout. Logs go to stderr (`RUST_LOG=debug` for more).
 
 Each clip contains the video, a **Mix** audio track (what players and Discord play) and
 one extra track per audio source, so the editor can mute or rebalance each one.
