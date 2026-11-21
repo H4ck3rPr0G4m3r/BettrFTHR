@@ -11,8 +11,6 @@
     "core:window:allow-close",
     "core:window:allow-start-dragging",
     "core:window:allow-hide",
-    "dialog:allow-open",
-    "opener:allow-reveal-item-in-dir",
-    "opener:allow-open-path"
+    "dialog:allow-open"
   ]
 }

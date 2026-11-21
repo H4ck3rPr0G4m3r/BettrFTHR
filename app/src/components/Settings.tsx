@@ -1,6 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { openPath } from "@tauri-apps/plugin-opener";
 import { Microphone, Plus, SpeakerHigh, Trash, Warning } from "@phosphor-icons/react";
 import { api, errorText, type AudioDevice, type AudioSource, type Settings as S, type SourceKind } from "../lib/api";
 import { useApp } from "../lib/store";
@@ -133,7 +132,13 @@ export function Settings() {
           <Section title="Library">
             <Row title="Clip folder" help={<span className="font-mono break-all">{draft.out_dir}</span>}>
               <div className="flex gap-2">
-                <Button size="sm" variant="ghost" onClick={() => openPath(saved.out_dir)}>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() =>
+                    api.openClipFolder().catch((e) => toast({ tone: "error", title: "Could not open the folder", body: errorText(e) }))
+                  }
+                >
                   Open
                 </Button>
                 <Button

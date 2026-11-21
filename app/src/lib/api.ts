@@ -95,7 +95,9 @@ export const api = {
   storeThumb: (path: string, jpeg: Uint8Array, duration: number) =>
     invoke<string>("store_thumb", { path, jpeg: Array.from(jpeg), duration }),
   renameClip: (path: string, title: string) => invoke<string>("rename_clip", { path, title }),
-  deleteClip: (path: string) => invoke<void>("delete_clip", { path }),
+  deleteClips: (paths: string[]) => invoke<void>("delete_clips", { paths }),
+  openClipFolder: () => invoke<void>("open_clip_folder"),
+  revealClip: (path: string) => invoke<void>("reveal_clip", { path }),
   copyClip: (path: string) => invoke<void>("copy_clip", { path }),
   listAudioDevices: () => invoke<AudioDevice[]>("list_audio_devices"),
 };

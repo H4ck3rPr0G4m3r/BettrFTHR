@@ -134,10 +134,29 @@ fn rename_clip(state: State<AppState>, path: PathBuf, title: String) -> Res<Path
 }
 
 #[tauri::command]
-fn delete_clip(state: State<AppState>, path: PathBuf) -> Res<()> {
+fn delete_clips(state: State<AppState>, paths: Vec<PathBuf>) -> Res<()> {
+    let root = state.settings.lock().out_dir.clone();
+    for p in &paths {
+        library::ensure_inside(&root, p).map_err(err)?;
+    }
+    library::recycle(&paths).map_err(err)
+}
+
+/// Opens the clip folder in Explorer (done here: the JS opener API needs a path scope).
+#[tauri::command]
+fn open_clip_folder(app: AppHandle, state: State<AppState>) -> Res<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = state.settings.lock().out_dir.clone();
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    app.opener().open_path(dir.to_string_lossy(), None::<&str>).map_err(err)
+}
+
+#[tauri::command]
+fn reveal_clip(app: AppHandle, state: State<AppState>, path: PathBuf) -> Res<()> {
+    use tauri_plugin_opener::OpenerExt;
     let root = state.settings.lock().out_dir.clone();
     library::ensure_inside(&root, &path).map_err(err)?;
-    library::recycle(&path).map_err(err)
+    app.opener().reveal_item_in_dir(&path).map_err(err)
 }
 
 #[tauri::command]
@@ -324,7 +343,9 @@ fn main() {
             list_clips,
             store_thumb,
             rename_clip,
-            delete_clip,
+            delete_clips,
+            open_clip_folder,
+            reveal_clip,
             copy_clip,
             list_audio_devices,
         ])

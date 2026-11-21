@@ -27,13 +27,19 @@ interface AppStore {
   view: View;
   search: string;
   toasts: Toast[];
+  /** Selected clip paths in the library (multi-select for bulk actions). */
+  selected: string[];
+  /** Last clicked card, for shift-click ranges. */
+  anchor: string | null;
 
   setView: (v: View) => void;
   setSearch: (s: string) => void;
   refreshClips: () => Promise<void>;
   patchClip: (path: string, patch: Partial<Clip>) => void;
   replaceClipPath: (oldPath: string, newPath: string, title: string) => void;
-  removeClip: (path: string) => void;
+  removeClips: (paths: string[]) => void;
+  toggleSelected: (path: string, range: string[] | null) => void;
+  setSelected: (paths: string[]) => void;
   setSettings: (s: Settings) => void;
   toast: (t: Omit<Toast, "id">) => void;
   dismiss: (id: number) => void;
@@ -51,8 +57,15 @@ export const useApp = create<AppStore>((set, get) => ({
   view: { page: "library", filter: { kind: "all" } },
   search: "",
   toasts: [],
+  selected: [],
+  anchor: null,
 
-  setView: (view) => set({ view }),
+  setView: (view) => {
+    const old = get().view;
+    const sameFilter =
+      old.page !== "settings" && view.page !== "settings" && JSON.stringify(old.filter) === JSON.stringify(view.filter);
+    set(sameFilter ? { view } : { view, selected: [], anchor: null });
+  },
   setSearch: (search) => set({ search }),
   refreshClips: async () => {
     try {
@@ -71,7 +84,23 @@ export const useApp = create<AppStore>((set, get) => ({
       view: view.page === "clip" && view.path === oldPath ? { ...view, path: newPath } : view,
     });
   },
-  removeClip: (path) => set({ clips: get().clips.filter((c) => c.path !== path) }),
+  removeClips: (paths) => {
+    const gone = new Set(paths);
+    set({
+      clips: get().clips.filter((c) => !gone.has(c.path)),
+      selected: get().selected.filter((p) => !gone.has(p)),
+    });
+  },
+  toggleSelected: (path, range) => {
+    const sel = new Set(get().selected);
+    if (range && range.length) {
+      // Shift-click: select everything between the anchor and this card.
+      for (const p of range) sel.add(p);
+    } else if (sel.has(path)) sel.delete(path);
+    else sel.add(path);
+    set({ selected: [...sel], anchor: path });
+  },
+  setSelected: (selected) => set({ selected, anchor: null }),
   setSettings: (settings) => set({ settings }),
   toast: (t) => {
     const id = ++toastId;

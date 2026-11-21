@@ -125,13 +125,19 @@ pub fn rename(path: &Path, title: &str) -> anyhow::Result<PathBuf> {
     Ok(target)
 }
 
-/// Moves a clip to the Recycle Bin (recoverable), never a hard delete.
-pub fn recycle(path: &Path) -> anyhow::Result<()> {
+/// Moves clips to the Recycle Bin (recoverable), never a hard delete. One shell operation
+/// for the whole batch, so deleting 40 clips is one quick step.
+pub fn recycle(paths: &[PathBuf]) -> anyhow::Result<()> {
     use windows::Win32::UI::Shell::{
         FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW, SHFileOperationW,
     };
-    let mut from: Vec<u16> = path.as_os_str().encode_wide_vec();
-    from.extend([0, 0]); // double-NUL terminated list
+    anyhow::ensure!(!paths.is_empty(), "nothing to delete");
+    let mut from: Vec<u16> = Vec::new();
+    for p in paths {
+        from.extend(p.as_os_str().encode_wide_vec());
+        from.push(0);
+    }
+    from.push(0); // double-NUL terminated list
     let mut op = SHFILEOPSTRUCTW {
         wFunc: FO_DELETE,
         pFrom: windows::core::PCWSTR(from.as_ptr()),
