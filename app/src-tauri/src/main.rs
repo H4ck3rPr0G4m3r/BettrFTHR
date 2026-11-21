@@ -50,6 +50,26 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+/// Development builds (run from cargo's `target` folder) never register themselves to start
+/// with Windows; only an installed copy does.
+fn is_dev_build() -> bool {
+    std::env::current_exe()
+        .map(|p| p.components().any(|c| c.as_os_str().eq_ignore_ascii_case("target")))
+        .unwrap_or(true)
+}
+
+fn apply_autostart(app: &AppHandle, enabled: bool) {
+    use tauri_plugin_autostart::ManagerExt;
+    if is_dev_build() {
+        return;
+    }
+    let launcher = app.autolaunch();
+    let res = if enabled { launcher.enable() } else { launcher.disable() };
+    if let Err(e) = res {
+        tracing::warn!("autostart: {e}");
+    }
+}
+
 fn write_engine_config(path: &Path, s: &Settings) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -87,6 +107,7 @@ fn set_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> R
     };
     state.detection_on.store(new.game_detection, Ordering::Relaxed);
     allow_media(&app, &new, &state.paths.thumbs);
+    apply_autostart(&app, new.start_with_windows);
     if restart {
         write_engine_config(&state.paths.engine_config, &new).map_err(err)?;
         state.engine.restart();
@@ -152,6 +173,19 @@ fn open_clip_folder(app: AppHandle, state: State<AppState>) -> Res<()> {
     let dir = state.settings.lock().out_dir.clone();
     std::fs::create_dir_all(&dir).map_err(err)?;
     app.opener().open_path(dir.to_string_lossy(), None::<&str>).map_err(err)
+}
+
+/// The folder with engine.log (for bug reports).
+#[tauri::command]
+fn open_logs(app: AppHandle) -> Res<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = app.path().app_local_data_dir().map_err(err)?;
+    app.opener().open_path(dir.to_string_lossy(), None::<&str>).map_err(err)
+}
+
+#[tauri::command]
+fn app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
 }
 
 #[tauri::command]
@@ -312,6 +346,10 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let handle = app.handle().clone();
@@ -383,7 +421,16 @@ fn main() {
                 });
             }
 
+            apply_autostart(&handle, app.state::<AppState>().settings.lock().start_with_windows);
             build_tray(app)?;
+            // The window starts hidden (no white flash); started with Windows it stays in the tray.
+            if std::env::args().any(|a| a == "--minimized") {
+                if let Some(w) = handle.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            } else {
+                show_main(&handle);
+            }
             Ok(())
         })
         .on_window_event(|window, ev| {
@@ -412,6 +459,8 @@ fn main() {
             delete_clips,
             open_clip_folder,
             reveal_clip,
+            open_logs,
+            app_version,
             copy_clip,
             probe_clip,
             export_clip,

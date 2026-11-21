@@ -74,6 +74,8 @@ pub struct Settings {
     /// Discord upload limit in MB (10 free, 50 Nitro Basic, 500 Nitro): Discord copies are
     /// compressed to fit when bigger.
     pub discord_limit_mb: u32,
+    /// Launch hidden in the tray when Windows starts.
+    pub start_with_windows: bool,
 }
 
 impl Default for Settings {
@@ -107,6 +109,7 @@ impl Default for Settings {
             save_sound: true,
             close_to_tray: true,
             discord_limit_mb: 10,
+            start_with_windows: true,
         }
     }
 }

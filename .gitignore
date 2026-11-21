@@ -8,3 +8,4 @@ dist/
 /.tools
 *.log
 /app/src-tauri/gen
+/app/src-tauri/binaries

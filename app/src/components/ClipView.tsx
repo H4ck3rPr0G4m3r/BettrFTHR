@@ -3,7 +3,6 @@ import {
   ArrowLeft,
   CaretLeft,
   CaretRight,
-  Copy,
   DiscordLogo,
   FolderOpen,
   PencilSimple,
@@ -27,7 +26,7 @@ import { ensureThumbs } from "../lib/thumbs";
 import { filterClips } from "./Library";
 import { Player, type PlayerHandle } from "./Player";
 import { TopBar } from "./TopBar";
-import { Button, GameTile, IconButton, KeyCap, cx } from "./ui";
+import { Button, GameTile, IconButton, cx } from "./ui";
 
 export function ClipView({ path, filter }: { path: string; filter: Filter }) {
   const clips = useApp((s) => s.clips);
@@ -325,7 +324,7 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
             ))}
         </div>
 
-        <aside className="flex w-[320px] shrink-0 flex-col overflow-y-auto border-l border-line bg-panel">
+        <aside className="flex w-[320px] shrink-0 flex-col overflow-y-auto border-l border-line bg-panel max-[1150px]:w-[280px]">
           {editing ? (
             probe && edit ? (
               <EditPanel
@@ -344,7 +343,7 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
             )
           ) : (
           <>
-          <div className="border-b border-line p-5">
+          <div className="border-b border-line px-5 pt-4 pb-4">
             {renaming ? (
               <input
                 autoFocus
@@ -369,74 +368,60 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
                 />
               </button>
             )}
-            <div className="mt-2.5 flex items-center gap-2 text-[13px] text-muted">
-              {clip.game && <GameTile name={clip.game} size={20} />}
-              <span>{clip.game ?? "Desktop"}</span>
+            <div className="mt-2 flex min-w-0 items-center gap-2 text-[13px] text-muted">
+              {clip.game && <GameTile name={clip.game} size={18} />}
+              <span className="truncate">{clip.game ?? "Desktop"}</span>
+              <span className="text-faint">·</span>
+              <span className="shrink-0 text-faint">{formatDateTime(clip.modified)}</span>
             </div>
 
-            <dl className="mt-5 grid grid-cols-2 gap-x-4 gap-y-3 text-[12.5px]">
-              <Meta label="Saved" value={formatDateTime(clip.modified)} wide />
+            <dl className="mt-4 grid grid-cols-3 gap-x-3 text-[12px]">
               <Meta label="Length" value={formatDuration(clip.duration) || "-"} />
               <Meta label="Size" value={formatBytes(clip.bytes)} />
-              <Meta label="Resolution" value={res ?? "-"} />
-              <Meta label="Type" value={clip.kind === "recording" ? "Recording" : "Replay clip"} />
+              <Meta label="Resolution" value={res ? res.replace("×", "x") : "-"} />
             </dl>
           </div>
 
-          <div className="border-b border-line p-5">
-            <div className="flex items-center gap-2 text-[13px] font-medium">
-              <DiscordLogo size={17} weight="fill" className="text-[#8c9eff]" />
-              Share to Discord
-            </div>
-            <Button variant="primary" size="lg" className="mt-3 w-full" onClick={copy} disabled={copying}>
-              <Copy size={17} weight="bold" />
-              {copying ? `Compressing ${Math.round(copyProgress * 100)}%` : "Copy clip"}
+          <div className="border-b border-line px-5 py-4">
+            <Button variant="primary" size="lg" className="w-full" onClick={copy} disabled={copying}>
+              <DiscordLogo size={18} weight="fill" />
+              {copying ? `Compressing ${Math.round(copyProgress * 100)}%` : "Copy for Discord"}
             </Button>
             {copying && (
               <div className="mt-2 h-1 overflow-hidden rounded-full bg-line">
                 <div className="h-full bg-accent transition-[width] duration-150" style={{ width: `${copyProgress * 100}%` }} />
               </div>
             )}
-            <p className="mt-2.5 text-[12.5px] leading-relaxed text-faint">
-              Then press <KeyCap>Ctrl</KeyCap> <KeyCap>V</KeyCap> in any Discord chat.
+            <p className="mt-2 text-[12px] leading-relaxed text-faint">
+              {tooBig
+                ? `Over your ${limitMb} MB limit, so the copy is compressed to fit. Then press Ctrl+V in Discord.`
+                : "Then press Ctrl+V in any Discord chat."}
             </p>
-            {tooBig && (
-              <p className="mt-3 text-[12.5px] leading-relaxed text-faint">
-                {formatBytes(clip.bytes)} is over your {limitMb} MB Discord limit, so the copy is compressed to fit.
-                Change the limit in Settings if you have Nitro.
-              </p>
-            )}
+            <Button className="mt-3 w-full" onClick={startEditing} title="Edit (E)">
+              <Scissors size={16} />
+              Trim and edit audio
+              {edit && probe && isDirty(edit, probe) && <span className="text-[11.5px] text-accent">unsaved</span>}
+            </Button>
           </div>
 
-          <div className="flex flex-col gap-1 p-3">
-            <Button variant="ghost" className="justify-start" onClick={startEditing} title="Edit (E)">
-              <Scissors size={17} />
-              Trim and edit audio
-              {edit && probe && isDirty(edit, probe) && <span className="ml-auto text-[11.5px] text-accent">unsaved</span>}
-            </Button>
-            <Button
-              variant="ghost"
-              className="justify-start"
+          <div className="grid grid-cols-3 gap-1 p-2">
+            <ActionButton
+              icon={<FolderOpen size={17} />}
+              label="Folder"
+              title="Show in folder"
               onClick={() =>
                 api.revealClip(clip.path).catch((e) => toast({ tone: "error", title: "Could not open", body: errorText(e) }))
               }
-            >
-              <FolderOpen size={17} />
-              Show in folder
-            </Button>
-            <Button variant="ghost" className="justify-start" onClick={startRename}>
-              <PencilSimple size={17} />
-              Rename
-            </Button>
-            <Button
-              variant={confirmDelete ? "danger" : "ghost"}
-              className="justify-start"
+            />
+            <ActionButton icon={<PencilSimple size={17} />} label="Rename" onClick={startRename} />
+            <ActionButton
+              icon={<Trash size={17} />}
+              label={confirmDelete ? "Confirm" : "Delete"}
+              title={confirmDelete ? "Click again to move to the Recycle Bin" : "Move to the Recycle Bin"}
+              danger={confirmDelete}
               onClick={del}
               onBlur={() => setConfirmDelete(false)}
-            >
-              <Trash size={17} />
-              {confirmDelete ? "Click again to move to Recycle Bin" : "Delete"}
-            </Button>
+            />
           </div>
           </>
           )}
@@ -472,7 +457,7 @@ function Filmstrip({ clips, current, onPick }: { clips: Clip[]; current: string;
         // Vertical wheel scrolls the strip sideways.
         if (strip.current && Math.abs(e.deltaY) > Math.abs(e.deltaX)) strip.current.scrollLeft += e.deltaY;
       }}
-      className="flex h-[150px] shrink-0 gap-3 overflow-x-auto overflow-y-hidden border-t border-line bg-panel px-5 pt-3 pb-2"
+      className="no-scrollbar flex h-[132px] shrink-0 gap-3 overflow-x-auto overflow-y-hidden border-t border-line bg-panel px-5 py-3 [@media(max-height:820px)]:h-[118px] [@media(max-height:820px)]:py-2"
       aria-label="Other clips"
     >
       {clips.map((c) => {
@@ -486,7 +471,7 @@ function Filmstrip({ clips, current, onPick }: { clips: Clip[]; current: string;
             }}
             onClick={() => onPick(c.path)}
             aria-current={on ? "true" : undefined}
-            className="group w-[160px] shrink-0 text-left outline-none"
+            className="group w-[160px] shrink-0 text-left outline-none [@media(max-height:820px)]:w-[132px]"
           >
             <div
               className={cx(
@@ -510,6 +495,37 @@ function Filmstrip({ clips, current, onPick }: { clips: Clip[]; current: string;
         );
       })}
     </div>
+  );
+}
+
+function ActionButton({
+  icon,
+  label,
+  title,
+  danger,
+  onClick,
+  onBlur,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  title?: string;
+  danger?: boolean;
+  onClick: () => void;
+  onBlur?: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      onBlur={onBlur}
+      title={title ?? label}
+      className={cx(
+        "flex h-14 flex-col items-center justify-center gap-1 rounded-ctl text-[12px] transition-colors",
+        danger ? "bg-rec/12 text-rec" : "text-muted hover:bg-hover hover:text-fg",
+      )}
+    >
+      {icon}
+      {label}
+    </button>
   );
 }
 

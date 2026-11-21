@@ -120,7 +120,8 @@ export function TrimOverlay({
       onPointerDown={drag(which)}
       className={cx(
         "pointer-events-auto absolute top-0 bottom-0 z-10 flex w-3 cursor-ew-resize items-center justify-center bg-accent",
-        which === "start" ? "-translate-x-full rounded-l-ctl" : "rounded-r-ctl",
+        // Inside the kept range, so neither handle can hang off the timeline.
+        which === "start" ? "rounded-l-ctl" : "-translate-x-full rounded-r-ctl",
       )}
       style={{ left: pct(which === "start" ? edit.start : edit.end, duration) }}
     >

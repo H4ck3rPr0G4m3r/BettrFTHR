@@ -27,6 +27,7 @@ export interface Settings {
   close_to_tray: boolean;
   /** Discord upload limit in MB; Discord copies are compressed to fit. */
   discord_limit_mb: number;
+  start_with_windows: boolean;
 }
 
 export type Phase = "idle" | "starting" | "running" | "crashed" | "missing";
@@ -126,6 +127,8 @@ export const api = {
   deleteClips: (paths: string[]) => invoke<void>("delete_clips", { paths }),
   openClipFolder: () => invoke<void>("open_clip_folder"),
   revealClip: (path: string) => invoke<void>("reveal_clip", { path }),
+  openLogs: () => invoke<void>("open_logs"),
+  appVersion: () => invoke<string>("app_version"),
   copyClip: (path: string) => invoke<void>("copy_clip", { path }),
   listAudioDevices: () => invoke<AudioDevice[]>("list_audio_devices"),
   probeClip: (path: string) => invoke<Probe>("probe_clip", { path }),

@@ -27,6 +27,10 @@ export function Settings() {
   const engine = useApp((s) => s.engine);
   const [draft, setDraft] = useState<S | null>(saved);
   const [busy, setBusy] = useState(false);
+  const [version, setVersion] = useState("");
+  useEffect(() => {
+    api.appVersion().then(setVersion, () => {});
+  }, []);
 
   useEffect(() => {
     if (!draft && saved) setDraft(saved);
@@ -190,6 +194,13 @@ export function Settings() {
                 onChange={(v) => set("buffer_mode", v)}
               />
             </Row>
+            <Row title="Start with Windows" help="Starts hidden in the tray, so clipping works right after you log in.">
+              <Toggle
+                label="Start with Windows"
+                checked={draft.start_with_windows}
+                onChange={(v) => set("start_with_windows", v)}
+              />
+            </Row>
             <Row title="Sound on save" help="A short chime when a clip or recording is saved.">
               <Toggle label="Sound on save" checked={draft.save_sound} onChange={(v) => set("save_sound", v)} />
             </Row>
@@ -199,6 +210,22 @@ export function Settings() {
                 checked={draft.close_to_tray}
                 onChange={(v) => set("close_to_tray", v)}
               />
+            </Row>
+          </Section>
+
+          <Section title="About">
+            <Row
+              title={`BettrFTHR ${version}`}
+              help="Open source (GPL-3.0). If something breaks, the engine log helps find out why."
+            >
+              <Button
+                size="sm"
+                onClick={() =>
+                  api.openLogs().catch((e) => toast({ tone: "error", title: "Could not open logs", body: errorText(e) }))
+                }
+              >
+                Open logs folder
+              </Button>
             </Row>
           </Section>
         </div>
