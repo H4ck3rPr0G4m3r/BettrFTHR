@@ -10,7 +10,7 @@ import {
   X,
 } from "@phosphor-icons/react";
 import type { Probe } from "../lib/api";
-import { DISCORD_FREE_BYTES, formatBytes } from "../lib/format";
+import { formatBytes } from "../lib/format";
 import { preciseTime } from "./Player";
 import { Button, KeyCap, cx } from "./ui";
 
@@ -62,6 +62,18 @@ function normalize(ranges: [number, number][]): [number, number][] {
     else out.push([...r]);
   }
   return out;
+}
+
+/** Export progress (0-1) from the backend while `active`. */
+export function useExportProgress(active: boolean) {
+  const [progress, setProgress] = useState(0);
+  useEffect(() => {
+    if (!active) return;
+    setProgress(0);
+    const off = listen<number>("export-progress", (e) => setProgress(e.payload));
+    return () => void off.then((f) => f());
+  }, [active]);
+  return progress;
 }
 
 const pct = (t: number, d: number) => `${(Math.max(0, Math.min(d, t)) / d) * 100}%`;
@@ -351,6 +363,7 @@ export function EditPanel({
   probe,
   edit,
   bytes,
+  limit,
   busy,
   onSave,
   onDiscord,
@@ -360,26 +373,22 @@ export function EditPanel({
   probe: Probe;
   edit: EditState;
   bytes: number;
+  /** Discord upload limit in bytes. */
+  limit: number;
   busy: "library" | "discord" | null;
   onSave: () => void;
   onDiscord: () => void;
   onReset: () => void;
   onCancel: () => void;
 }) {
-  const [progress, setProgress] = useState(0);
-  useEffect(() => {
-    if (!busy) return;
-    setProgress(0);
-    const off = listen<number>("export-progress", (e) => setProgress(e.payload));
-    return () => void off.then((f) => f());
-  }, [busy]);
+  const progress = useExportProgress(!!busy);
 
   const length = edit.end - edit.start;
   // Video dominates the size and is copied, so size scales with length. Discord copies
   // also drop the per-source tracks (192 kbps each).
   const extra = Math.max(0, probe.sources.length > 1 ? probe.sources.length : 0) * 24_000 * length;
   const est = Math.max(0, (bytes * length) / probe.duration - (probe.sources.length > 1 ? extra : 0));
-  const tooBig = est > DISCORD_FREE_BYTES;
+  const tooBig = est > limit;
   const mutedSections = edit.sources.reduce((n, s) => n + s.mutes.length, 0);
   const mutedTracks = edit.sources.filter((s) => s.muted).length;
 
@@ -428,16 +437,17 @@ export function EditPanel({
         </Button>
         <Button size="lg" onClick={onDiscord} disabled={!!busy}>
           <DiscordLogo size={17} weight="fill" className="text-[#8c9eff]" />
-          {busy === "discord" ? `Preparing ${Math.round(progress * 100)}%` : "Copy edit for Discord"}
+          {busy === "discord" ? `${tooBig ? "Compressing" : "Preparing"} ${Math.round(progress * 100)}%` : "Copy edit for Discord"}
         </Button>
         {busy && (
           <div className="h-1 overflow-hidden rounded-full bg-line">
             <div className="h-full bg-accent transition-[width] duration-150" style={{ width: `${progress * 100}%` }} />
           </div>
         )}
-        <p className={cx("text-[12.5px] leading-relaxed", tooBig ? "text-warn" : "text-faint")}>
-          About {formatBytes(est)} for Discord.
-          {tooBig && " That's over the 10 MB free limit: trim it shorter, or send it with Nitro."}
+        <p className="text-[12.5px] leading-relaxed text-faint">
+          {tooBig
+            ? `About ${formatBytes(est)}, over your ${Math.round(limit / 1e6)} MB Discord limit, so the Discord copy is compressed to fit.`
+            : `About ${formatBytes(est)} for Discord, under your ${Math.round(limit / 1e6)} MB limit.`}
         </p>
         <p className="text-[12px] leading-relaxed text-faint">The original clip stays as it is.</p>
       </div>

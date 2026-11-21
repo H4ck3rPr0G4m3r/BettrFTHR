@@ -71,6 +71,9 @@ pub struct Settings {
     pub game_detection: bool,
     pub save_sound: bool,
     pub close_to_tray: bool,
+    /// Discord upload limit in MB (10 free, 50 Nitro Basic, 500 Nitro): Discord copies are
+    /// compressed to fit when bigger.
+    pub discord_limit_mb: u32,
 }
 
 impl Default for Settings {
@@ -103,6 +106,7 @@ impl Default for Settings {
             game_detection: true,
             save_sound: true,
             close_to_tray: true,
+            discord_limit_mb: 10,
         }
     }
 }
@@ -148,6 +152,7 @@ impl Settings {
             self.height = self.height.clamp(360, 4320);
         }
         self.audio.truncate(8);
+        self.discord_limit_mb = self.discord_limit_mb.clamp(1, 2000);
         for a in &mut self.audio {
             a.gain = a.gain.clamp(0.0, 4.0);
         }

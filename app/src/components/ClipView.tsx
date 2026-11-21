@@ -11,9 +11,18 @@ import {
   Trash,
 } from "@phosphor-icons/react";
 import { api, errorText, fileUrl, type Clip, type Probe } from "../lib/api";
-import { EditPanel, TrimOverlay, Tracks, initialEdit, isDirty, snapStart, type EditState } from "./Editor";
+import {
+  EditPanel,
+  TrimOverlay,
+  Tracks,
+  initialEdit,
+  isDirty,
+  snapStart,
+  useExportProgress,
+  type EditState,
+} from "./Editor";
 import { useApp, type Filter } from "../lib/store";
-import { DISCORD_FREE_BYTES, clipTitle, formatBytes, formatDateTime, formatDuration } from "../lib/format";
+import { clipTitle, discordLimitBytes, formatBytes, formatDateTime, formatDuration } from "../lib/format";
 import { ensureThumbs } from "../lib/thumbs";
 import { filterClips } from "./Library";
 import { Player, type PlayerHandle } from "./Player";
@@ -47,6 +56,10 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
   const [probe, setProbe] = useState<Probe | null>(null);
   const [edit, setEdit] = useState<EditState | null>(null);
   const [busy, setBusy] = useState<"library" | "discord" | null>(null);
+  const [copying, setCopying] = useState(false);
+  const copyProgress = useExportProgress(copying);
+  const limitMb = useApp((s) => s.settings?.discord_limit_mb ?? 10);
+  const limit = discordLimitBytes(limitMb);
 
   const back = () => setView({ page: "library", filter });
   const goTo = (p: string) => setView({ page: "clip", path: p, filter });
@@ -111,7 +124,7 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
         toast({
           tone: "saved",
           title: "Edit copied to clipboard",
-          body: `${formatBytes(res.bytes)}. Paste it into Discord with Ctrl+V.`,
+          body: `${formatBytes(res.bytes)}${res.reencoded ? `, compressed to ${res.reencoded.height}p` : ""}. Paste it into Discord with Ctrl+V.`,
         });
       } else {
         await useApp.getState().refreshClips();
@@ -191,14 +204,28 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
     );
   }
 
-  const tooBig = clip.bytes > DISCORD_FREE_BYTES;
+  const tooBig = clip.bytes > limit;
 
+  // Small enough: the file itself goes on the clipboard. Too big for the user's Discord
+  // limit: a compressed copy is made first.
   const copy = async () => {
     try {
-      await api.copyClip(clip.path);
-      toast({ tone: "saved", title: "Copied to clipboard", body: "Paste it into any Discord chat with Ctrl+V." });
+      if (!tooBig) {
+        await api.copyClip(clip.path);
+        toast({ tone: "saved", title: "Copied to clipboard", body: "Paste it into any Discord chat with Ctrl+V." });
+        return;
+      }
+      setCopying(true);
+      const res = await api.exportClip({ input: clip.path, start: 0, end: 1e9, sources: [], target: "discord" });
+      toast({
+        tone: "saved",
+        title: "Compressed copy on the clipboard",
+        body: `${formatBytes(res.bytes)}${res.reencoded ? ` at ${res.reencoded.height}p${res.reencoded.fps}` : ""}. Paste it into Discord with Ctrl+V.`,
+      });
     } catch (e) {
       toast({ tone: "error", title: "Could not copy", body: errorText(e) });
+    } finally {
+      setCopying(false);
     }
   };
 
@@ -305,6 +332,7 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
                 probe={probe}
                 edit={edit}
                 bytes={clip.bytes}
+                limit={limit}
                 busy={busy}
                 onSave={() => runExport("library")}
                 onDiscord={() => runExport("discord")}
@@ -360,16 +388,22 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
               <DiscordLogo size={17} weight="fill" className="text-[#8c9eff]" />
               Share to Discord
             </div>
-            <Button variant="primary" size="lg" className="mt-3 w-full" onClick={copy}>
+            <Button variant="primary" size="lg" className="mt-3 w-full" onClick={copy} disabled={copying}>
               <Copy size={17} weight="bold" />
-              Copy clip
+              {copying ? `Compressing ${Math.round(copyProgress * 100)}%` : "Copy clip"}
             </Button>
+            {copying && (
+              <div className="mt-2 h-1 overflow-hidden rounded-full bg-line">
+                <div className="h-full bg-accent transition-[width] duration-150" style={{ width: `${copyProgress * 100}%` }} />
+              </div>
+            )}
             <p className="mt-2.5 text-[12.5px] leading-relaxed text-faint">
               Then press <KeyCap>Ctrl</KeyCap> <KeyCap>V</KeyCap> in any Discord chat.
             </p>
             {tooBig && (
-              <p className="mt-3 rounded-ctl border border-warn/25 bg-warn/8 px-3 py-2 text-[12.5px] leading-relaxed text-warn">
-                {formatBytes(clip.bytes)} is over Discord's 10 MB limit for accounts without Nitro.
+              <p className="mt-3 text-[12.5px] leading-relaxed text-faint">
+                {formatBytes(clip.bytes)} is over your {limitMb} MB Discord limit, so the copy is compressed to fit.
+                Change the limit in Settings if you have Nitro.
               </p>
             )}
           </div>

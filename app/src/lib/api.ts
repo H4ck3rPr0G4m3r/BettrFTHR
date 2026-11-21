@@ -25,6 +25,8 @@ export interface Settings {
   game_detection: boolean;
   save_sound: boolean;
   close_to_tray: boolean;
+  /** Discord upload limit in MB; Discord copies are compressed to fit. */
+  discord_limit_mb: number;
 }
 
 export type Phase = "idle" | "starting" | "running" | "crashed" | "missing";
@@ -106,6 +108,8 @@ export interface ExportResult {
   start: number;
   seconds: number;
   bytes: number;
+  /** Set when the clip had to be re-encoded to fit the limit. */
+  reencoded: { width: number; height: number; fps: number; video_kbps: number } | null;
 }
 
 export const api = {

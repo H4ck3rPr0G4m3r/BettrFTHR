@@ -209,6 +209,8 @@ async fn export_clip(app: AppHandle, state: State<'_, AppState>, req: ExportRequ
         end: req.end,
         sources: req.sources,
         keep_sources: !discord,
+        // Decimal MB, a little under Discord's MiB limits, to stay on the safe side.
+        fit_bytes: discord.then(|| state.settings.lock().discord_limit_mb as u64 * 1_000_000),
     };
     let job_file = state.paths.exports.join(format!("job-{}.json", std::process::id()));
     let h = app.clone();

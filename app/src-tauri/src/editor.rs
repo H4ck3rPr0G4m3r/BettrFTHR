@@ -66,6 +66,8 @@ pub struct ExportJob {
     pub end: f64,
     pub sources: Vec<SourceEdit>,
     pub keep_sources: bool,
+    /// Re-encode to fit when the lossless cut is bigger than this.
+    pub fit_bytes: Option<u64>,
 }
 
 /// Runs an export; `progress` gets 0..1. Returns the engine's result object.

@@ -73,8 +73,8 @@ export function clipTitle(c: Clip): string {
   return `${c.kind === "recording" ? "Recording" : "Clip"} at ${time}${m[10] ? " (edited)" : ""}`;
 }
 
-/** Discord's upload limit without Nitro. */
-export const DISCORD_FREE_BYTES = 10 * 1024 * 1024;
+/** The Discord upload limit in bytes (decimal MB, as the backend fits to). */
+export const discordLimitBytes = (mb: number | undefined) => (mb ?? 10) * 1_000_000;
 
 /** Stable, muted color for a game's monogram tile. */
 export function gameHue(name: string): number {

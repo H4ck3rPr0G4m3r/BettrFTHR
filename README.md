@@ -11,17 +11,11 @@ with a Rust capture engine and a focus on stability over features. See
 
 - **Engine**: replay clips, manual recording, any number of audio sources (one track each
   plus a mix), crash recovery. Soak-tested.
-- **App**: library grouped by game and day, clip player, copy-to-clipboard for Discord,
+- **App**: library grouped by game and day with multi-select delete, clip view with a
+  precise timeline and a filmstrip of the other clips, editor (trim, mute or turn down each
+  audio source, mute sections), copy for Discord that compresses to your upload limit,
   settings (length, fps, resolution, quality, hotkeys incl. F13-F24, audio sources),
-  game detection, tray. The trim / mic editor and a fit-to-10-MB export are next.
-
-## Building
-
-Requirements: Windows 10 1903+ / 11, Rust (stable, MSVC toolchain).
-
-```sh
-cargo build --release
-```
+  game detection, tray. Installer and autostart are next.
 
 ## Running the app
 

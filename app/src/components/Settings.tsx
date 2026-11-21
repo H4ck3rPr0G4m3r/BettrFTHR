@@ -154,6 +154,20 @@ export function Settings() {
             </Row>
           </Section>
 
+          <Section title="Discord">
+            <Row
+              title="Upload limit"
+              help="Copies for Discord are compressed to fit. Free accounts: 10 MB, Nitro Basic: 50 MB, Nitro: 500 MB."
+            >
+              <Segmented
+                label="Discord upload limit"
+                value={draft.discord_limit_mb}
+                options={withCustom([10, 50, 500], draft.discord_limit_mb).map((v) => ({ value: v, label: `${v} MB` }))}
+                onChange={(v) => set("discord_limit_mb", v)}
+              />
+            </Row>
+          </Section>
+
           <Section title="Behavior">
             <Row title="Detect games" help="Files clips under the game you're playing and names them after it.">
               <Toggle label="Detect games" checked={draft.game_detection} onChange={(v) => set("game_detection", v)} />
