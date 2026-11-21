@@ -161,7 +161,7 @@ export const Player = forwardRef<
         />
       </div>
 
-      <div className="shrink-0 border-t border-line bg-panel px-5 pt-2 pb-3">
+      <div className="@container shrink-0 border-t border-line bg-panel px-5 pt-2 pb-3">
         <Timeline
           duration={duration}
           onSeek={seekTo}
@@ -183,7 +183,7 @@ export const Player = forwardRef<
             onClick={api.toggle}
             aria-label={playing ? "Pause (Space)" : "Play (Space)"}
             title={playing ? "Pause (Space)" : "Play (Space)"}
-            className="flex size-9 items-center justify-center rounded-ctl bg-raised text-fg hover:bg-hover"
+            className="flex size-9 shrink-0 items-center justify-center rounded-ctl bg-raised text-fg hover:bg-hover"
           >
             {playing ? <Pause size={18} weight="fill" /> : <Play size={18} weight="fill" />}
           </button>
@@ -197,7 +197,8 @@ export const Player = forwardRef<
             Space play, arrows 1 s, comma / period 1 frame
           </span>
           <div className="flex-1" />
-          <div className="flex items-center rounded-ctl border border-line bg-bg p-0.5" role="radiogroup" aria-label="Speed">
+          {/* The controls adapt to the player width: speed, then the volume slider, give way first. */}
+          <div className="hidden items-center rounded-ctl border border-line bg-bg p-0.5 @xl:flex" role="radiogroup" aria-label="Speed">
             {[0.25, 0.5, 1].map((r) => (
               <button
                 key={r}
@@ -213,7 +214,7 @@ export const Player = forwardRef<
               </button>
             ))}
           </div>
-          <div className="flex items-center gap-1.5">
+          <div className="flex shrink-0 items-center gap-1.5">
             <button
               onClick={api.toggleMute}
               aria-label={muted ? "Unmute (M)" : "Mute (M)"}
@@ -235,14 +236,14 @@ export const Player = forwardRef<
                 writePref("player.volume", v);
               }}
               aria-label="Volume"
-              className="w-24"
+              className="hidden w-24 @md:block"
             />
           </div>
           <button
             onClick={api.toggleFullscreen}
             aria-label="Fullscreen (F)"
             title="Fullscreen (F)"
-            className="flex size-8 items-center justify-center rounded-ctl text-muted hover:bg-hover hover:text-fg"
+            className="flex size-8 shrink-0 items-center justify-center rounded-ctl text-muted hover:bg-hover hover:text-fg"
           >
             {full ? <ArrowsIn size={18} /> : <ArrowsOut size={18} />}
           </button>
@@ -320,7 +321,8 @@ function Timeline({
   }
 
   return (
-    <div className="relative select-none">
+    // Inset so the playhead knob and trim handles stay visible at 0% and 100%.
+    <div className="relative mx-2 select-none">
       {/* Ruler */}
       <div className="relative h-5">
         {ticks.map(({ t, major }) => (

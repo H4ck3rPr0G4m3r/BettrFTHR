@@ -23,6 +23,13 @@ const call = (method, params = {}) =>
     ws.send(JSON.stringify({ id: my, method, params }));
   });
 
+// VIEWPORT=1100x680 emulates a smaller window for this command (overrides last per session).
+if (process.env.VIEWPORT) {
+  const [width, height] = process.env.VIEWPORT.split("x").map(Number);
+  await call("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
+  await new Promise((r) => setTimeout(r, 400));
+}
+
 if (cmd === "eval") {
   const r = await call("Runtime.evaluate", { expression: arg, awaitPromise: true, returnByValue: true });
   console.log(JSON.stringify(r.result.value ?? r.exceptionDetails?.text ?? r.result.description));

@@ -61,10 +61,17 @@ textarea {
   background: color-mix(in srgb, var(--color-accent) 35%, transparent);
 }
 
-/* Thin scrollbars that match the panels. */
+/* Thin scrollbars that stay out of the way: invisible until the pointer is over the
+   scrolling area. */
 * {
   scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+*:hover {
   scrollbar-color: var(--color-line-strong) transparent;
+}
+.no-scrollbar {
+  scrollbar-width: none;
 }
 
 input[type="range"] {

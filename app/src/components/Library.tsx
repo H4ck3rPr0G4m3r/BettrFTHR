@@ -67,7 +67,7 @@ export function Library({ filter }: { filter: Filter }) {
           </>
         }
       />
-      <div className="min-h-0 flex-1 overflow-y-auto px-6 pt-5 pb-28">
+      <div className={cx("min-h-0 flex-1 overflow-y-auto px-6 pt-5", selecting ? "pb-24" : "pb-6")}>
         {!loaded ? (
           <Skeleton />
         ) : shown.length === 0 ? (
