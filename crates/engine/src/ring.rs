@@ -100,23 +100,22 @@ impl PacketRing {
         }
     }
 
-    /// Video: the last `seconds_hns` of history, starting at the latest keyframe at or
-    /// before `newest - seconds_hns` (so the clip is never shorter than asked when history
-    /// allows). Falls back to the oldest keyframe.
+    /// Video: about the last `seconds_hns` of history, starting at the keyframe that makes
+    /// the clip length closest to the request (with 0.5 s GOPs: within ±0.25 s, so a "30 s"
+    /// clip is 30 s, not 30-31 s). `0` gives the latest keyframe. Falls back to the oldest.
     pub fn video_snapshot(&self, seconds_hns: i64) -> Vec<Packet> {
-        let Some(newest) = self.packets.back().map(|p| p.pts) else {
+        let Some(last) = self.packets.back() else {
             return Vec::new();
         };
-        let target = newest - seconds_hns;
-        let mut start = 0;
-        for (i, p) in self.packets.iter().enumerate() {
-            if p.pts > target {
-                break;
-            }
-            if p.key {
-                start = i;
-            }
-        }
+        let end = last.pts + last.duration;
+        let start = self
+            .packets
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.key)
+            .min_by_key(|(_, p)| ((end - p.pts) - seconds_hns).abs())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
         self.packets.range(start..).cloned().collect()
     }
 
@@ -151,9 +150,12 @@ mod tests {
         }
         let snap = r.video_snapshot(100);
         assert!(snap[0].key);
-        let newest = 990;
-        assert!(newest - snap[0].pts >= 100, "clip must cover the requested span");
-        assert!(newest - snap[0].pts < 150, "but not much more than one GOP extra");
+        let end = 1000;
+        assert_eq!(end - snap[0].pts, 100, "closest keyframe gives the exact span here");
+        let snap = r.video_snapshot(120);
+        assert!((end - snap[0].pts - 120).abs() <= 25, "within half a GOP of the request");
+        let snap = r.video_snapshot(0);
+        assert_eq!(snap[0].pts, 950, "0 = latest keyframe");
     }
 
     #[test]

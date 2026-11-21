@@ -108,7 +108,9 @@ impl VideoPipeline {
             height: out_h,
             fps,
             bitrate_kbps: cfg.bitrate_kbps,
-            gop_frames: fps,
+            // Half-second GOPs: clip lengths land within ±0.25 s of the request, and the
+            // editor can cut on keyframes at a fine enough step without re-encoding.
+            gop_frames: (fps / 2).max(1),
         };
         let on_frame_shared = shared.clone();
         let on_error_shared = shared.clone();

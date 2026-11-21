@@ -39,7 +39,16 @@ fn parse_key(k: &str) -> Option<u32> {
     if b.len() == 1 && (b[0].is_ascii_uppercase() || b[0].is_ascii_digit()) {
         return Some(b[0] as u32);
     }
+    if let Some(n) = k.strip_prefix("NUM").and_then(|n| n.parse::<u32>().ok()) {
+        return (n <= 9).then_some(0x60 + n);
+    }
     match k {
+        "NUMMULTIPLY" => Some(0x6A),
+        "NUMADD" => Some(0x6B),
+        "NUMSUBTRACT" => Some(0x6D),
+        "NUMDECIMAL" => Some(0x6E),
+        "NUMDIVIDE" => Some(0x6F),
+        "DELETE" | "DEL" => Some(0x2E),
         "HOME" => Some(0x24),
         "END" => Some(0x23),
         "INSERT" | "INS" => Some(0x2D),
@@ -62,6 +71,13 @@ pub fn spawn(bindings: Vec<(i32, Hotkey)>, tx: Sender<i32>) -> std::thread::Join
                 let mods = HOT_KEY_MODIFIERS(hk.modifiers | MOD_NOREPEAT.0);
                 if let Err(e) = unsafe { RegisterHotKey(None, *id, mods, hk.vk) } {
                     tracing::error!(?hk, "hotkey registration failed (in use by another app?): {e}");
+                    let action = if *id == 1 { "save" } else { "record" };
+                    crate::emit(serde_json::json!({
+                        "event": "warning",
+                        "kind": "hotkey",
+                        "action": action,
+                        "message": format!("the {action} hotkey is already used by another app"),
+                    }));
                 }
             }
             let mut msg = MSG::default();
@@ -96,5 +112,10 @@ mod tests {
             })
         );
         assert_eq!(Hotkey::parse("Ctrl+"), None);
+        assert_eq!(Hotkey::parse("F14"), Some(Hotkey { modifiers: 0, vk: 0x7D }));
+        assert_eq!(Hotkey::parse("F24"), Some(Hotkey { modifiers: 0, vk: 0x87 }));
+        assert_eq!(Hotkey::parse("Num7"), Some(Hotkey { modifiers: 0, vk: 0x67 }));
+        assert_eq!(Hotkey::parse("NumAdd"), Some(Hotkey { modifiers: 0, vk: 0x6B }));
+        assert_eq!(Hotkey::parse("F25"), None);
     }
 }

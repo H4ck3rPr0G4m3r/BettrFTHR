@@ -50,6 +50,22 @@ struct SampleTable {
 }
 
 pub fn write_mp4(path: &Path, video: &VideoTrack, audio: &[AudioTrack]) -> Result<MuxStats> {
+    write_mp4_with(path, video, None, audio)
+}
+
+/// Video payloads read on demand while writing (exports of long recordings would not fit
+/// in memory). `video.packets` then carry timing and key flags; their `data` is ignored.
+pub struct VideoSource<'a> {
+    pub sizes: &'a [u32],
+    pub fetch: &'a mut dyn FnMut(usize) -> Result<Vec<u8>>,
+}
+
+pub fn write_mp4_with(
+    path: &Path,
+    video: &VideoTrack,
+    mut source: Option<VideoSource>,
+    audio: &[AudioTrack],
+) -> Result<MuxStats> {
     if video.packets.is_empty() {
         bail!("no video packets to write");
     }
@@ -79,7 +95,10 @@ pub fn write_mp4(path: &Path, video: &VideoTrack, audio: &[AudioTrack]) -> Resul
             Some(next) => (to_vts(next.pts).saturating_sub(start)).max(1) as u32,
             None => nominal,
         };
-        vt.sizes.push(p.data.len() as u32);
+        vt.sizes.push(match &source {
+            Some(src) => *src.sizes.get(i).context("video size missing")?,
+            None => p.data.len() as u32,
+        });
         vt.durations.push(dur);
         if p.key {
             vt.keys.push(i as u32 + 1);
@@ -140,12 +159,18 @@ pub fn write_mp4(path: &Path, video: &VideoTrack, audio: &[AudioTrack]) -> Resul
         w.write_all(b"mdat")?;
         w.write_all(&(16 + payload).to_be_bytes())?;
         for &(t, i, _) in &order {
-            let data = if t == 0 {
-                &video.packets[i].data
+            if t == 0 {
+                match source.as_mut() {
+                    Some(src) => {
+                        let data = (src.fetch)(i)?;
+                        anyhow::ensure!(data.len() as u32 == vt.sizes[i], "video sample {i} changed size");
+                        w.write_all(&data)?;
+                    }
+                    None => w.write_all(&video.packets[i].data)?,
+                }
             } else {
-                &audio[t - 1].packets[i].data
-            };
-            w.write_all(data)?;
+                w.write_all(&audio[t - 1].packets[i].data)?;
+            }
         }
         let f = w.into_inner().map_err(|e| e.into_error())?;
         f.sync_all()?;
@@ -291,6 +316,11 @@ fn build_moov(
         }
         if fragmented {
             w.boxed(b"mvex", |w| {
+                // Placeholder that `finish` turns into an `mehd` (total duration). Until then
+                // (or after a crash) it is an ignorable `free` box.
+                w.u32(16);
+                w.bytes(b"free");
+                w.zeros(8);
                 for id in 1..=audio.len() as u32 + 1 {
                     w.full(b"trex", 0, 0, |w| {
                         w.u32(id);
@@ -505,6 +535,8 @@ pub struct FragmentedWriter {
     bytes: u64,
     video_frames: usize,
     video_end: u64,
+    /// File offset of the 16-byte placeholder that becomes `mehd` on finish.
+    mehd_at: Option<u64>,
 }
 
 fn empty_table() -> SampleTable {
@@ -536,6 +568,14 @@ impl FragmentedWriter {
         });
         let ats: Vec<SampleTable> = audio.iter().map(|_| empty_table()).collect();
         let moov = build_moov(video, &empty_table(), audio, &ats, 0, true);
+        let mehd_at = moov
+            .windows(4)
+            .position(|b| b == b"mvex")
+            .and_then(|m| {
+                let pat = [0, 0, 0, 16, b'f', b'r', b'e', b'e'];
+                moov[m..].windows(8).position(|b| b == pat).map(|i| m + i)
+            })
+            .map(|i| (ftyp.0.len() + i) as u64);
         file.write_all(&ftyp.0)?;
         file.write_all(&moov)?;
         file.flush()?;
@@ -548,6 +588,7 @@ impl FragmentedWriter {
             bytes: (ftyp.0.len() + moov.len()) as u64,
             video_frames: 0,
             video_end: 0,
+            mehd_at,
         })
     }
 
@@ -639,7 +680,18 @@ impl FragmentedWriter {
 
     pub fn finish(mut self) -> Result<MuxStats> {
         self.file.flush()?;
-        let f = self.file.into_inner().map_err(|e| e.into_error())?;
+        let mut f = self.file.into_inner().map_err(|e| e.into_error())?;
+        if let Some(at) = self.mehd_at {
+            use std::io::{Seek, SeekFrom};
+            let dur = to_movie(self.video_end, VIDEO_TIMESCALE);
+            let mut mehd = Vec::with_capacity(16);
+            mehd.extend_from_slice(&16u32.to_be_bytes());
+            mehd.extend_from_slice(b"mehd");
+            mehd.extend_from_slice(&0u32.to_be_bytes());
+            mehd.extend_from_slice(&dur.to_be_bytes());
+            f.seek(SeekFrom::Start(at))?;
+            f.write_all(&mehd)?;
+        }
         f.sync_all()?;
         Ok(MuxStats {
             duration_hns: self.video_end as i64 * 10_000_000 / VIDEO_TIMESCALE as i64,
