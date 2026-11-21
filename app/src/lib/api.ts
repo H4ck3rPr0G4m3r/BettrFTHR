@@ -84,6 +84,30 @@ export interface AudioDevice {
   default: boolean;
 }
 
+export interface Probe {
+  duration: number;
+  width: number;
+  height: number;
+  fps: number;
+  /** Keyframe times (s): where a lossless cut can start. */
+  keyframes: number[];
+  peaks_per_second: number;
+  sources: { name: string; peaks: number[] }[];
+  has_mix: boolean;
+}
+
+export interface SourceEdit {
+  gain: number;
+  mutes: [number, number][];
+}
+
+export interface ExportResult {
+  path: string;
+  start: number;
+  seconds: number;
+  bytes: number;
+}
+
 export const api = {
   getSettings: () => invoke<Settings>("get_settings"),
   setSettings: (settings: Settings) => invoke<Settings>("set_settings", { settings }),
@@ -100,6 +124,9 @@ export const api = {
   revealClip: (path: string) => invoke<void>("reveal_clip", { path }),
   copyClip: (path: string) => invoke<void>("copy_clip", { path }),
   listAudioDevices: () => invoke<AudioDevice[]>("list_audio_devices"),
+  probeClip: (path: string) => invoke<Probe>("probe_clip", { path }),
+  exportClip: (req: { input: string; start: number; end: number; sources: SourceEdit[]; target: "library" | "discord" }) =>
+    invoke<ExportResult>("export_clip", { req }),
 };
 
 /** URL the webview can load a local file from (asset protocol, scoped to the library). */

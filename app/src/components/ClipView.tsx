@@ -1,6 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, CaretLeft, CaretRight, Copy, DiscordLogo, FolderOpen, PencilSimple, Trash } from "@phosphor-icons/react";
-import { api, errorText, fileUrl, type Clip } from "../lib/api";
+import {
+  ArrowLeft,
+  CaretLeft,
+  CaretRight,
+  Copy,
+  DiscordLogo,
+  FolderOpen,
+  PencilSimple,
+  Scissors,
+  Trash,
+} from "@phosphor-icons/react";
+import { api, errorText, fileUrl, type Clip, type Probe } from "../lib/api";
+import { EditPanel, TrimOverlay, Tracks, initialEdit, isDirty, snapStart, type EditState } from "./Editor";
 import { useApp, type Filter } from "../lib/store";
 import { DISCORD_FREE_BYTES, clipTitle, formatBytes, formatDateTime, formatDuration } from "../lib/format";
 import { ensureThumbs } from "../lib/thumbs";
@@ -32,6 +43,10 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [res, setRes] = useState<string | null>(null);
   const player = useRef<PlayerHandle>(null);
+  const [editing, setEditing] = useState(false);
+  const [probe, setProbe] = useState<Probe | null>(null);
+  const [edit, setEdit] = useState<EditState | null>(null);
+  const [busy, setBusy] = useState<"library" | "discord" | null>(null);
 
   const back = () => setView({ page: "library", filter });
   const goTo = (p: string) => setView({ page: "clip", path: p, filter });
@@ -40,13 +55,101 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
     setConfirmDelete(false);
     setRenaming(false);
     setRes(null);
+    setEditing(false);
+    setProbe(null);
+    setEdit(null);
   }, [path]);
+
+  const startEditing = async () => {
+    setEditing(true);
+    try {
+      const p = probe ?? (await api.probeClip(path));
+      setProbe(p);
+      setEdit((e) => e ?? initialEdit(p));
+    } catch (e) {
+      setEditing(false);
+      toast({ tone: "error", title: "Could not open the editor", body: errorText(e) });
+    }
+  };
+
+  // While editing, playback stays inside the trimmed range.
+  useEffect(() => {
+    if (!editing || !edit) return;
+    const v = player.current?.video();
+    if (!v) return;
+    const onPlay = () => {
+      if (v.currentTime < edit.start - 0.05 || v.currentTime >= edit.end - 0.05) v.currentTime = edit.start;
+    };
+    let raf = 0;
+    const loop = () => {
+      if (!v.paused && v.currentTime >= edit.end) {
+        v.pause();
+        v.currentTime = edit.end;
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    v.addEventListener("play", onPlay);
+    return () => {
+      cancelAnimationFrame(raf);
+      v.removeEventListener("play", onPlay);
+    };
+  }, [editing, edit]);
+
+  const runExport = async (target: "library" | "discord") => {
+    if (!edit || !probe || !clip) return;
+    setBusy(target);
+    try {
+      const res = await api.exportClip({
+        input: clip.path,
+        start: edit.start,
+        end: edit.end,
+        target,
+        sources: edit.sources.map((s) => ({ gain: s.muted ? 0 : s.gain, mutes: s.mutes })),
+      });
+      if (target === "discord") {
+        toast({
+          tone: "saved",
+          title: "Edit copied to clipboard",
+          body: `${formatBytes(res.bytes)}. Paste it into Discord with Ctrl+V.`,
+        });
+      } else {
+        await useApp.getState().refreshClips();
+        setEditing(false);
+        toast({
+          tone: "saved",
+          title: "Saved as a new clip",
+          body: `${Math.round(res.seconds)} seconds, ${formatBytes(res.bytes)}`,
+          action: { label: "View", run: () => goTo(res.path) },
+        });
+      }
+    } catch (e) {
+      toast({ tone: "error", title: "Export failed", body: errorText(e) });
+    } finally {
+      setBusy(null);
+    }
+  };
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement).tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
       const p = player.current;
+      const v = p?.video();
+      if (editing && edit && probe && v && (e.key === "i" || e.key === "o")) {
+        e.preventDefault();
+        if (e.key === "i") setEdit({ ...edit, start: Math.min(snapStart(v.currentTime, probe.keyframes), edit.end - 0.5) });
+        else setEdit({ ...edit, end: Math.max(edit.start + 0.5, v.currentTime) });
+        return;
+      }
+      if (e.key === "e" && !editing && !e.ctrlKey) {
+        void startEditing();
+        return;
+      }
+      if (e.key === "Escape" && editing && !document.fullscreenElement) {
+        if (!busy) setEditing(false);
+        return;
+      }
       if (e.altKey && e.key === "ArrowLeft") {
         e.preventDefault();
         if (prev) goTo(prev.path);
@@ -173,10 +276,46 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
               const v = player.current?.video();
               if (v) setRes(`${v.videoWidth}×${v.videoHeight}`);
             }}
+            overlay={(duration) =>
+              editing && probe && edit ? (
+                <TrimOverlay
+                  duration={duration}
+                  edit={edit}
+                  keyframes={probe.keyframes}
+                  onChange={(start, end) => setEdit({ ...edit, start, end })}
+                />
+              ) : null
+            }
           />
+          {editing &&
+            (probe && edit ? (
+              <Tracks probe={probe} edit={edit} setEdit={setEdit} video={() => player.current?.video() ?? null} />
+            ) : (
+              <div className="shrink-0 border-t border-line bg-panel px-5 py-3">
+                <div className="skeleton h-10 rounded-ctl bg-raised" />
+                <div className="skeleton mt-3 h-10 rounded-ctl bg-raised" />
+              </div>
+            ))}
         </div>
 
         <aside className="flex w-[320px] shrink-0 flex-col overflow-y-auto border-l border-line bg-panel">
+          {editing ? (
+            probe && edit ? (
+              <EditPanel
+                probe={probe}
+                edit={edit}
+                bytes={clip.bytes}
+                busy={busy}
+                onSave={() => runExport("library")}
+                onDiscord={() => runExport("discord")}
+                onReset={() => setEdit(initialEdit(probe))}
+                onCancel={() => setEditing(false)}
+              />
+            ) : (
+              <div className="p-5 text-[13px] text-muted">Reading the clip's audio tracks</div>
+            )
+          ) : (
+          <>
           <div className="border-b border-line p-5">
             {renaming ? (
               <input
@@ -236,6 +375,11 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
           </div>
 
           <div className="flex flex-col gap-1 p-3">
+            <Button variant="ghost" className="justify-start" onClick={startEditing} title="Edit (E)">
+              <Scissors size={17} />
+              Trim and edit audio
+              {edit && probe && isDirty(edit, probe) && <span className="ml-auto text-[11.5px] text-accent">unsaved</span>}
+            </Button>
             <Button
               variant="ghost"
               className="justify-start"
@@ -260,10 +404,12 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
               {confirmDelete ? "Click again to move to Recycle Bin" : "Delete"}
             </Button>
           </div>
+          </>
+          )}
         </aside>
       </div>
 
-      <Filmstrip clips={list} current={clip.path} onPick={goTo} />
+      {!editing && <Filmstrip clips={list} current={clip.path} onPick={goTo} />}
     </div>
   );
 }

@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod clipboard;
+mod editor;
 mod engine;
 mod games;
 mod library;
@@ -24,6 +25,8 @@ struct Paths {
     settings: PathBuf,
     engine_config: PathBuf,
     thumbs: PathBuf,
+    /// Short-lived Discord exports and export job files.
+    exports: PathBuf,
 }
 
 struct AppState {
@@ -164,6 +167,64 @@ fn copy_clip(path: PathBuf) -> Res<()> {
     clipboard::copy_file(&path).map_err(err)
 }
 
+/// Duration, keyframes and per-source waveforms for the editor (cached per file version).
+#[tauri::command]
+async fn probe_clip(state: State<'_, AppState>, path: PathBuf) -> Res<Value> {
+    let root = state.settings.lock().out_dir.clone();
+    library::ensure_inside(&root, &path).map_err(err)?;
+    let cache = library::cache_path(&path, &state.paths.thumbs, "probe.json");
+    tauri::async_runtime::spawn_blocking(move || editor::probe(&path, cache))
+        .await
+        .map_err(err)?
+}
+
+#[derive(serde::Deserialize)]
+struct ExportRequest {
+    input: PathBuf,
+    start: f64,
+    end: f64,
+    sources: Vec<editor::SourceEdit>,
+    /// "library": a new clip next to the original (keeps per-source tracks);
+    /// "discord": a temporary file without extra tracks, put on the clipboard.
+    target: String,
+}
+
+#[tauri::command]
+async fn export_clip(app: AppHandle, state: State<'_, AppState>, req: ExportRequest) -> Res<Value> {
+    let root = state.settings.lock().out_dir.clone();
+    library::ensure_inside(&root, &req.input).map_err(err)?;
+    let discord = req.target == "discord";
+    let output = if discord {
+        let name = req.input.file_name().ok_or("bad clip path")?;
+        let out = state.paths.exports.join(name);
+        let _ = std::fs::remove_file(&out);
+        out
+    } else {
+        library::edit_path(&req.input)
+    };
+    let job = editor::ExportJob {
+        input: req.input,
+        output: output.clone(),
+        start: req.start,
+        end: req.end,
+        sources: req.sources,
+        keep_sources: !discord,
+    };
+    let job_file = state.paths.exports.join(format!("job-{}.json", std::process::id()));
+    let h = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        editor::export(&job, &job_file, |p| {
+            let _ = h.emit("export-progress", p);
+        })
+    })
+    .await
+    .map_err(err)??;
+    if discord {
+        clipboard::copy_file(&output).map_err(err)?;
+    }
+    Ok(result)
+}
+
 /// Audio endpoints for the source picker. Asks the engine binary directly so it works even
 /// while the engine is idle.
 #[tauri::command]
@@ -260,7 +321,10 @@ fn main() {
                 settings: config_dir.join("settings.json"),
                 engine_config: config_dir.join("engine.json"),
                 thumbs: data_dir.join("thumbs"),
+                exports: data_dir.join("exports"),
             };
+            let _ = std::fs::create_dir_all(&paths.exports);
+            editor::clean_exports(&paths.exports);
             let settings = Settings::load(&paths.settings);
             if !paths.settings.exists() {
                 let _ = settings.save(&paths.settings);
@@ -347,6 +411,8 @@ fn main() {
             open_clip_folder,
             reveal_clip,
             copy_clip,
+            probe_clip,
+            export_clip,
             list_audio_devices,
         ])
         .build(tauri::generate_context!())

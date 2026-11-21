@@ -100,6 +100,26 @@ pub fn store_thumb(clip: &Path, cache: &Path, jpeg: &[u8], duration: f64) -> any
     Ok(thumb)
 }
 
+/// Cache file for derived data of a clip (e.g. `probe.json`), invalidated when it changes.
+pub fn cache_path(clip: &Path, cache: &Path, suffix: &str) -> Option<PathBuf> {
+    let (bytes, modified) = file_info(clip)?;
+    Some(cache.join(format!("{}.{suffix}", cache_key(clip, bytes, modified))))
+}
+
+/// `<dir>/<title> (edit).mp4`, numbered if taken.
+pub fn edit_path(original: &Path) -> PathBuf {
+    let dir = original.parent().unwrap_or(Path::new("."));
+    let stem = original.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let stem = stem.trim_end_matches(" (edit)").to_owned();
+    let mut p = dir.join(format!("{stem} (edit).mp4"));
+    let mut n = 2;
+    while p.exists() {
+        p = dir.join(format!("{stem} (edit {n}).mp4"));
+        n += 1;
+    }
+    p
+}
+
 /// Only files inside the library may be renamed or deleted from the UI.
 pub fn ensure_inside(root: &Path, path: &Path) -> anyhow::Result<()> {
     let root = std::fs::canonicalize(root)?;

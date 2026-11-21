@@ -57,14 +57,20 @@ export function groupByDay(clips: Clip[]): { label: string; clips: Clip[] }[] {
   return groups;
 }
 
-const DEFAULT_NAME = /^(.*?)\s*(Recording\s+)?\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2}( \(\d+\))?$/;
+const DEFAULT_NAME =
+  /^(.*?)\s*(Recording\s+)?(\d{4})-(\d{2})-(\d{2}) (\d{2})-(\d{2})-(\d{2})( \(\d+\))?( \(edit( \d+)?\))?$/;
 
-/** Engine file names are timestamps; show those as "Clip at 10:12" and keep custom names. */
+/**
+ * Engine file names are timestamps; show those as "Clip at 10:12" (time taken from the
+ * name, so an edit made later still shows when it happened) and keep custom names.
+ */
 export function clipTitle(c: Clip): string {
-  if (DEFAULT_NAME.test(c.title)) {
-    return `${c.kind === "recording" ? "Recording" : "Clip"} at ${formatTime(c.modified)}`;
-  }
-  return c.title;
+  const m = DEFAULT_NAME.exec(c.title);
+  if (!m) return c.title;
+  const [, , , y, mo, d, h, mi, s] = m;
+  const when = new Date(+y, +mo - 1, +d, +h, +mi, +s).getTime();
+  const time = Number.isFinite(when) ? formatTime(when) : formatTime(c.modified);
+  return `${c.kind === "recording" ? "Recording" : "Clip"} at ${time}${m[10] ? " (edited)" : ""}`;
 }
 
 /** Discord's upload limit without Nitro. */
