@@ -8,7 +8,10 @@
 //! - when a source goes quiet (loopback stops delivering when nothing plays, unplugged mic)
 //!   the timeline is padded with silence up to "now − latency";
 //! - stamps a driver puts in the future (Realtek USB loopback: ~1 s) are pulled back to
-//!   when the audio was really captured (`StampFix`).
+//!   when the audio was really captured, and stamps impossibly far in the past are pulled
+//!   forward (`StampFix`);
+//! - a microphone that stops delivering packets, or delivers nothing but digital zeros
+//!   (which no real microphone does), is reopened instead of padding silence forever.
 //! So sample N of every track always means the same wall-clock instant as the video frame
 //! stamped with that time. That is the whole A/V sync story.
 
@@ -20,7 +23,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::JoinHandle;
 use windows::Win32::Media::Audio::*;
 use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
@@ -113,7 +116,7 @@ impl Timeline {
 // ------------------------------------------------------------------------------------------
 // Device timestamp sanity
 
-/// Removes a device's "future" timestamp error.
+/// Removes a device's timestamp error.
 ///
 /// Some drivers (seen: Realtek USB Audio in loopback) stamp packets ~1 s or more after the
 /// moment their audio was captured, so trusting the stamp places that source's sound late in
@@ -121,6 +124,11 @@ impl Timeline {
 /// how far a stamp lands beyond that is the device's error minus our (small, positive)
 /// pickup delay. The largest such excess over a recent window estimates the error, and it is
 /// subtracted from every stamp. Honest devices never exceed the bound, so they are untouched.
+///
+/// The opposite error is as bad: a stamp far in the *past* lands behind what the timeline
+/// already padded with silence, so the whole packet is dropped as overlap and the track
+/// records silence. We poll every 10 ms, so when even the freshest packet of a window is well
+/// behind real time the stamps are wrong, and are pulled forward by that much.
 #[derive(Default)]
 pub struct StampFix {
     correction: i64,
@@ -131,6 +139,10 @@ pub struct StampFix {
 
 /// How long a lower error must persist before the correction relaxes to it.
 const STAMP_WINDOW_HNS: i64 = 2 * HNS_PER_SEC;
+/// Freshest packet of a window older than this: the device stamps in the past.
+const STAMP_LATE_HNS: i64 = 1_000_000; // 100 ms
+/// Older than the 200 ms capture buffer plus slack: impossible, corrected at once.
+const STAMP_IMPOSSIBLE_HNS: i64 = 3_000_000; // 300 ms
 
 impl StampFix {
     /// Corrected capture time for a packet stamped `stamp` that reached us at `now` and
@@ -139,6 +151,10 @@ impl StampFix {
         let excess = stamp - (now - dur);
         // Never place audio in the future: raise immediately.
         self.correction = self.correction.max(excess);
+        // Nor impossibly far in the past (this also drops a stale "future" correction fast).
+        if excess - self.correction < -STAMP_IMPOSSIBLE_HNS {
+            self.correction = excess;
+        }
         if self.window_end == 0 {
             self.window_end = now + STAMP_WINDOW_HNS;
             self.window_max = excess;
@@ -146,12 +162,15 @@ impl StampFix {
             self.window_max = self.window_max.max(excess);
         }
         if now >= self.window_end {
-            // Follow a device whose error shrank (or vanished) since.
-            self.correction = self.window_max.max(0);
+            // Follow a device whose error changed (or vanished) since.
+            self.correction = if self.window_max < -STAMP_LATE_HNS {
+                self.window_max
+            } else {
+                self.window_max.max(0)
+            };
             self.window_max = i64::MIN;
             self.window_end = now + STAMP_WINDOW_HNS;
         }
-        self.correction = self.correction.max(0);
         stamp - self.correction
     }
 
@@ -162,7 +181,7 @@ impl StampFix {
 
     /// True once per source, the first time the error is large enough to mention.
     fn should_warn(&mut self) -> bool {
-        if !self.warned && self.correction > 50 * HNS_PER_SEC / 1000 {
+        if !self.warned && self.correction.abs() > 50 * HNS_PER_SEC / 1000 {
             self.warned = true;
             return true;
         }
@@ -311,6 +330,14 @@ fn resolve_device(spec: &SourceSpec) -> Result<IMMDevice> {
     }
 }
 
+/// What one `drain` call received.
+#[derive(Default)]
+struct Drained {
+    packets: u32,
+    /// Largest absolute sample; exactly 0.0 means digital silence.
+    peak: f32,
+}
+
 struct Source {
     client: IAudioClient,
     capture: IAudioCaptureClient,
@@ -373,12 +400,13 @@ impl Source {
     }
 
     /// Drains all available packets into the timeline.
-    fn drain(&mut self, timeline: &mut Timeline, scratch: &mut Vec<f32>) -> Result<()> {
+    fn drain(&mut self, timeline: &mut Timeline, scratch: &mut Vec<f32>) -> Result<Drained> {
+        let mut got = Drained::default();
         unsafe {
             loop {
                 let next = self.capture.GetNextPacketSize()?;
                 if next == 0 {
-                    return Ok(());
+                    return Ok(got);
                 }
                 let mut data = std::ptr::null_mut();
                 let mut frames = 0u32;
@@ -394,22 +422,79 @@ impl Source {
                     scratch.extend_from_slice(std::slice::from_raw_parts(data as *const f32, n));
                 }
                 self.capture.ReleaseBuffer(frames)?;
+                got.packets += 1;
+                got.peak = scratch.iter().fold(got.peak, |p, &x| p.max(x.abs()));
                 // qpc is already in 100 ns units on the QPC timebase.
                 let now = clock::now_hns();
                 let dur = frames as i64 * HNS_PER_SEC / RATE as i64;
                 let stamp = if qpc != 0 { qpc as i64 } else { now - dur };
                 let t = self.stamps.correct(stamp, now, dur);
                 if self.stamps.should_warn() {
-                    tracing::warn!(
-                        device = %self.name,
-                        ms = self.stamps.correction() / 10_000,
-                        "audio device timestamps run ahead of real time; correcting"
-                    );
+                    let ms = self.stamps.correction() / 10_000;
+                    if ms > 0 {
+                        tracing::warn!(device = %self.name, ms, "audio device timestamps run ahead of real time; correcting");
+                    } else {
+                        tracing::warn!(device = %self.name, ms, "audio device timestamps run behind real time; correcting");
+                    }
                 }
                 timeline.push(t, scratch);
             }
         }
     }
+}
+
+/// `--meter`: opens one source for `secs` and prints, per second, its peak level and how far
+/// the device's packet stamps sit from real time (negative = in the past). Diagnoses "my mic
+/// records nothing" without saving clips.
+pub fn meter(spec: &SourceSpec, secs: u32) -> Result<()> {
+    let src = Source::open(spec)?;
+    println!("device: {}", src.name);
+    unsafe {
+        let vol: windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume =
+            resolve_device(spec)?.Activate(CLSCTX_ALL, None)?;
+        println!("windows: muted={} volume={:.0}%", vol.GetMute()?.as_bool(), vol.GetMasterVolumeLevelScalar()? * 100.0);
+    }
+    let end = clock::now_hns() + secs as i64 * HNS_PER_SEC;
+    let mut next = clock::now_hns() + HNS_PER_SEC;
+    let (mut peak, mut packets, mut silent) = (0f32, 0u32, 0u32);
+    let (mut lag_min, mut lag_max) = (i64::MAX, i64::MIN);
+    while clock::now_hns() < end {
+        unsafe {
+            while src.capture.GetNextPacketSize()? > 0 {
+                let mut data = std::ptr::null_mut();
+                let (mut frames, mut flags, mut qpc) = (0u32, 0u32, 0u64);
+                src.capture.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
+                let now = clock::now_hns();
+                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null() {
+                    silent += 1;
+                } else {
+                    let n = frames as usize * CHANNELS as usize;
+                    peak = std::slice::from_raw_parts(data as *const f32, n)
+                        .iter()
+                        .fold(peak, |p, &x| p.max(x.abs()));
+                }
+                let lag = qpc as i64 + frames as i64 * HNS_PER_SEC / RATE as i64 - now;
+                lag_min = lag_min.min(lag);
+                lag_max = lag_max.max(lag);
+                packets += 1;
+                src.capture.ReleaseBuffer(frames)?;
+            }
+        }
+        if clock::now_hns() >= next {
+            let lag = |v: i64| if packets > 0 { v / 10_000 } else { 0 };
+            println!(
+                "packets={packets} silent={silent} peak={:.1} dBFS stamps=[{} .. {}] ms",
+                20.0 * peak.max(1e-9).log10(),
+                lag(lag_min),
+                lag(lag_max),
+            );
+            (peak, packets, silent) = (0.0, 0, 0);
+            (lag_min, lag_max) = (i64::MAX, i64::MIN);
+            next += HNS_PER_SEC;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 impl Drop for Source {
@@ -577,6 +662,22 @@ pub struct TrackShared {
     pub ring: Mutex<PacketRing>,
     /// Friendly name of the device currently open ("" while unavailable).
     pub device: Mutex<String>,
+    /// "ok", "no_signal" (a microphone delivering only digital silence) or "unavailable".
+    pub health: Mutex<&'static str>,
+    /// Peak sample since the last `take_peak` (f32 bits).
+    peak: AtomicU32,
+}
+
+impl TrackShared {
+    /// Peak level (0..) since the previous call, for the app's level meters.
+    pub fn take_peak(&self) -> f32 {
+        f32::from_bits(self.peak.swap(0, Ordering::Relaxed))
+    }
+
+    fn note_peak(&self, p: f32) {
+        // Non-negative floats order like their bit patterns.
+        self.peak.fetch_max(p.max(0.0).to_bits(), Ordering::Relaxed);
+    }
 }
 
 pub struct AudioShared {
@@ -655,6 +756,8 @@ impl AudioEngine {
                 name,
                 ring: Mutex::new(PacketRing::audio(span, AUDIO_MAX_BYTES)),
                 device: Mutex::new(String::new()),
+                health: Mutex::new("unavailable"),
+                peak: AtomicU32::new(0),
             })
             .collect();
         let shared = Arc::new(AudioShared {
@@ -728,14 +831,40 @@ impl Track {
     }
 }
 
+/// An open microphone that delivered no packet for this long has stalled.
+const STALL_HNS: i64 = 15_000_000; // 1.5 s
+/// Nothing but exact zeros for this long: muted, or the stream broke without an error.
+const ZEROS_HNS: i64 = 30_000_000; // 3 s
+/// Longest wait between reopens of a microphone that stays digitally silent.
+const ZEROS_RETRY_MAX_HNS: i64 = 60 * HNS_PER_SEC;
+
 struct SourceSlot {
     source: Option<Source>,
     timeline: Timeline,
     retry_at: i64,
     warned: bool,
+    /// When the open source last delivered a packet / a non-zero sample.
+    last_packet: i64,
+    last_signal: i64,
+    /// Reopen delay for a digitally silent microphone (doubles while it stays silent).
+    zeros_wait: i64,
+    zeros_warned: bool,
 }
 
 impl SourceSlot {
+    fn new(origin: i64) -> Self {
+        Self {
+            source: None,
+            timeline: Timeline::new(origin),
+            retry_at: 0,
+            warned: false,
+            last_packet: 0,
+            last_signal: 0,
+            zeros_wait: ZEROS_HNS,
+            zeros_warned: false,
+        }
+    }
+
     fn poll(&mut self, shared: &TrackShared, scratch: &mut Vec<f32>) {
         let now = clock::now_hns();
         if self.source.is_none() && now >= self.retry_at {
@@ -745,6 +874,8 @@ impl SourceSlot {
                     *shared.device.lock() = s.name.clone();
                     self.source = Some(s);
                     self.warned = false;
+                    self.last_packet = now;
+                    self.last_signal = now;
                 }
                 Err(e) => {
                     if !self.warned {
@@ -757,13 +888,56 @@ impl SourceSlot {
             }
         }
         if let Some(s) = &mut self.source {
-            if let Err(e) = s.drain(&mut self.timeline, scratch) {
-                // Typically AUDCLNT_E_DEVICE_INVALIDATED: headset unplugged / default changed.
-                tracing::warn!(track = %shared.name, "audio source lost: {e:#}; reopening");
-                self.source = None;
-                self.retry_at = now + HNS_PER_SEC / 2;
+            match s.drain(&mut self.timeline, scratch) {
+                Ok(got) => {
+                    if got.packets > 0 {
+                        self.last_packet = now;
+                        shared.note_peak(got.peak);
+                    }
+                    if got.peak > 0.0 {
+                        self.last_signal = now;
+                        self.zeros_wait = ZEROS_HNS;
+                        if self.zeros_warned {
+                            tracing::info!(track = %shared.name, "audio source has signal again");
+                            self.zeros_warned = false;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Typically AUDCLNT_E_DEVICE_INVALIDATED: headset unplugged / default changed.
+                    tracing::warn!(track = %shared.name, "audio source lost: {e:#}; reopening");
+                    self.source = None;
+                    self.retry_at = now + HNS_PER_SEC / 2;
+                }
             }
         }
+        // Loopback delivers nothing while nothing plays, but a microphone always streams. One
+        // that stops, or sends only zeros, broke without telling us: reopen it rather than
+        // recording silence until the engine restarts.
+        if shared.spec.kind == SourceKind::Input && self.source.is_some() {
+            if now - self.last_packet > STALL_HNS {
+                tracing::warn!(track = %shared.name, "audio source stopped delivering audio; reopening");
+                self.source = None;
+                self.retry_at = now;
+            } else if now - self.last_signal > self.zeros_wait {
+                if !self.zeros_warned {
+                    tracing::warn!(
+                        track = %shared.name,
+                        "audio source records only digital silence (muted in Windows, or the device stopped); reopening"
+                    );
+                    self.zeros_warned = true;
+                }
+                self.source = None;
+                self.retry_at = now;
+                // Back off while it stays silent (a muted mic, a quiet virtual cable).
+                self.zeros_wait = (self.zeros_wait * 2).min(ZEROS_RETRY_MAX_HNS);
+            }
+        }
+        *shared.health.lock() = match &self.source {
+            None if self.retry_at > now => "unavailable",
+            _ if self.zeros_warned => "no_signal",
+            _ => "ok",
+        };
         // A missing or quiet source still advances, as silence.
         self.timeline.pad_until(now - PAD_LAG_HNS);
     }
@@ -784,14 +958,7 @@ fn run_audio(shared: &AudioShared, stop: &AtomicBool, init: crossbeam_channel::S
             return Err(e);
         }
     };
-    let mut slots: Vec<SourceSlot> = (0..n)
-        .map(|_| SourceSlot {
-            source: None,
-            timeline: Timeline::new(origin),
-            retry_at: 0,
-            warned: false,
-        })
-        .collect();
+    let mut slots: Vec<SourceSlot> = (0..n).map(|_| SourceSlot::new(origin)).collect();
     let _ = init.send(Ok(()));
 
     let block = AAC_FRAME as usize;
@@ -956,6 +1123,48 @@ mod tests {
             last = packet(&mut fix, HNS_PER_SEC + i * hns(480), 0, 0);
         }
         assert_eq!(last, 0);
+    }
+
+    #[test]
+    fn past_stamps_are_pulled_forward() {
+        // A device stamping 800 ms in the past.
+        let mut fix = StampFix::default();
+        for i in 0..1000 {
+            let now = HNS_PER_SEC + i * hns(480);
+            let err = packet(&mut fix, now, (i % 5) * 20_000, -8_000_000);
+            assert!(err.abs() <= hns(10), "packet {i}: err {err}");
+        }
+    }
+
+    #[test]
+    fn slightly_late_stamps_are_trusted() {
+        // 60 ms of pickup delay is plausible on a busy system: leave it alone.
+        let mut fix = StampFix::default();
+        for i in 0..1000 {
+            let now = HNS_PER_SEC + i * hns(480);
+            assert_eq!(packet(&mut fix, now, 600_000, 0), 0);
+        }
+    }
+
+    #[test]
+    fn late_stamps_still_reach_the_timeline() {
+        // Without the fix every packet stamped 1 s late lands behind the padded timeline, is
+        // dropped as overlap, and the track records pure silence.
+        let mut fix = StampFix::default();
+        let mut t = Timeline::new(0);
+        let mut kept = 0;
+        for i in 0..500 {
+            let now = 10 * HNS_PER_SEC + i * hns(480);
+            t.pad_until(now - PAD_LAG_HNS);
+            let before = t.pending.iter().filter(|&&x| x != 0.0).count();
+            let dur = hns(480);
+            t.push(fix.correct(now - dur - HNS_PER_SEC, now, dur), &frames(480));
+            kept += t.pending.iter().filter(|&&x| x != 0.0).count() - before;
+            let n = t.pending_frames();
+            let mut out = Vec::new();
+            t.take(n, &mut out);
+        }
+        assert!(kept > 2 * 480 * 450, "most audio kept, got {kept} samples");
     }
 
     #[test]

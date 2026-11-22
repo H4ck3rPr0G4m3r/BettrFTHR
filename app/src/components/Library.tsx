@@ -48,6 +48,7 @@ export function Library({ filter }: { filter: Filter }) {
   }, [order, selected.length, setSelected, recordingPath]);
 
   const totalBytes = shown.reduce((n, c) => n + c.bytes, 0);
+  const storage = useApp((s) => s.settings?.storage);
   const title =
     filter.kind === "all" ? "All clips" : filter.kind === "recordings" ? "Recordings" : filter.game;
   const selecting = selected.length > 0;
@@ -62,6 +63,7 @@ export function Library({ filter }: { filter: Filter }) {
             {loaded && shown.length > 0 && (
               <span className="font-mono text-[12px] text-faint">
                 {shown.length} · {formatBytes(totalBytes)}
+                {storage?.enabled && filter.kind === "all" && !search.trim() && ` of ${formatBytes(storage.limit_gb * 1024 ** 3)}`}
               </span>
             )}
           </>

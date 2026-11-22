@@ -55,6 +55,41 @@ pub enum BufferMode {
     Games,
 }
 
+/// Automatic cleanup when the library grows past a size limit.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Storage {
+    /// Keep the library under `limit_gb`. Off by default: nothing is touched unless asked.
+    pub enabled: bool,
+    /// GiB, the same units the app shows sizes in.
+    pub limit_gb: f64,
+    /// First re-encode the oldest clips smaller (each clip only once).
+    pub compress: bool,
+    /// Only this many of the oldest clips are compressed; beyond that the oldest is recycled
+    /// and the next one in line takes its place.
+    pub compress_oldest: u32,
+    /// Then, if that is not enough, move the oldest clips to the Recycle Bin.
+    pub delete: bool,
+}
+
+impl Default for Storage {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            limit_gb: 50.0,
+            compress: true,
+            delete: true,
+            compress_oldest: 10,
+        }
+    }
+}
+
+impl Storage {
+    pub fn limit_bytes(&self) -> u64 {
+        (self.limit_gb * 1024.0 * 1024.0 * 1024.0) as u64
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -79,6 +114,7 @@ pub struct Settings {
     pub sound_style: crate::sound::Style,
     /// 0..1
     pub sound_volume: f32,
+    pub storage: Storage,
 }
 
 impl Default for Settings {
@@ -115,6 +151,7 @@ impl Default for Settings {
             start_with_windows: true,
             sound_style: crate::sound::Style::Rise,
             sound_volume: 0.7,
+            storage: Storage::default(),
         }
     }
 }
@@ -162,6 +199,11 @@ impl Settings {
         self.audio.truncate(8);
         self.discord_limit_mb = self.discord_limit_mb.clamp(1, 2000);
         self.sound_volume = self.sound_volume.clamp(0.0, 1.0);
+        if !self.storage.limit_gb.is_finite() {
+            self.storage.limit_gb = Storage::default().limit_gb;
+        }
+        self.storage.limit_gb = ((self.storage.limit_gb * 10.0).round() / 10.0).clamp(1.0, 100_000.0);
+        self.storage.compress_oldest = self.storage.compress_oldest.clamp(1, 100_000);
         for a in &mut self.audio {
             a.gain = a.gain.clamp(0.0, 4.0);
         }
@@ -215,6 +257,12 @@ mod tests {
         assert_eq!(s.replay_seconds, 5);
         assert_eq!(s.audio.len(), 2);
         assert_eq!(s.hotkeys.save, "F9");
+        assert!(!s.storage.enabled, "cleanup is opt-in");
+        let s: Settings = serde_json::from_str(r#"{"storage": {"enabled": true, "limit_gb": 0}}"#).unwrap();
+        let s = s.sanitized();
+        assert!(s.storage.enabled && s.storage.compress && s.storage.delete);
+        assert_eq!(s.storage.limit_gb, 1.0);
+        assert_eq!(s.storage.compress_oldest, 10);
     }
 
     #[test]

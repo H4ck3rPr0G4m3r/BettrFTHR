@@ -11,6 +11,32 @@ export interface AudioSource {
   gain: number;
 }
 
+export interface StorageSettings {
+  /** Keep the library under `limit_gb` (GiB). */
+  enabled: boolean;
+  limit_gb: number;
+  /** First re-encode the oldest clips smaller. */
+  compress: boolean;
+  /** Only this many of the oldest are compressed; past that the oldest is recycled. */
+  compress_oldest: number;
+  /** Then move the oldest clips to the Recycle Bin. */
+  delete: boolean;
+}
+
+export interface StorageActivity {
+  at: number;
+  compressed: number;
+  saved_bytes: number;
+  recycled: number;
+  recycled_bytes: number;
+}
+
+export interface StorageStatus {
+  busy: string | null;
+  note: string | null;
+  last: StorageActivity | null;
+}
+
 export interface Settings {
   out_dir: string;
   replay_seconds: number;
@@ -31,6 +57,7 @@ export interface Settings {
   sound_style: "glass" | "pop" | "shutter" | "rise" | "tick";
   /** 0..1 */
   sound_volume: number;
+  storage: StorageSettings;
 }
 
 export type Phase = "idle" | "starting" | "running" | "crashed" | "missing";
@@ -44,6 +71,17 @@ export interface ReadyInfo {
   audio_tracks: string[] | null;
 }
 
+export interface AudioSourceStatus {
+  track: string;
+  kind: SourceKind;
+  /** Device currently open; "" while unavailable. */
+  device: string | null;
+  /** "no_signal": a microphone sending only digital silence (muted, or the device stopped). */
+  health?: "ok" | "no_signal" | "unavailable";
+  /** Peak over the last second, 0..1. */
+  level?: number;
+}
+
 export interface Status {
   ticks: number;
   encoded: number;
@@ -51,7 +89,7 @@ export interface Status {
   captured: number;
   buffered_seconds: number;
   buffered_mb: number;
-  audio_sources: { track: string; kind: SourceKind; device: string | null }[];
+  audio_sources: AudioSourceStatus[];
   recording: string | null;
   game: string | null;
 }
@@ -135,6 +173,8 @@ export const api = {
   appVersion: () => invoke<string>("app_version"),
   copyClip: (path: string) => invoke<void>("copy_clip", { path }),
   listAudioDevices: () => invoke<AudioDevice[]>("list_audio_devices"),
+  storageStatus: () => invoke<StorageStatus>("storage_status"),
+  storageRun: () => invoke<void>("storage_run"),
   probeClip: (path: string) => invoke<Probe>("probe_clip", { path }),
   exportClip: (req: { input: string; start: number; end: number; sources: SourceEdit[]; target: "library" | "discord" }) =>
     invoke<ExportResult>("export_clip", { req }),

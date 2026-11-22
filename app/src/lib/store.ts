@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { listen } from "@tauri-apps/api/event";
-import { api, errorText, type Clip, type EngineState, type Game, type Settings, type Status } from "./api";
+import { api, errorText, type Clip, type EngineState, type Game, type Settings, type Status, type StorageStatus } from "./api";
 
 export type Filter = { kind: "all" } | { kind: "recordings" } | { kind: "game"; game: string };
 
@@ -22,6 +22,7 @@ interface AppStore {
   status: Status | null;
   game: Game | null;
   settings: Settings | null;
+  storage: StorageStatus | null;
   clips: Clip[];
   clipsLoaded: boolean;
   view: View;
@@ -52,6 +53,7 @@ export const useApp = create<AppStore>((set, get) => ({
   status: null,
   game: null,
   settings: null,
+  storage: null,
   clips: [],
   clipsLoaded: false,
   view: { page: "library", filter: { kind: "all" } },
@@ -113,8 +115,13 @@ export const useApp = create<AppStore>((set, get) => ({
 /** Subscribes to backend events once; returns an unsubscribe function. */
 export async function connect(): Promise<() => void> {
   const s = useApp.getState();
-  const [engine, settings, game] = await Promise.all([api.engineState(), api.getSettings(), api.currentGame()]);
-  useApp.setState({ engine, settings, game, status: engine.status });
+  const [engine, settings, game, storage] = await Promise.all([
+    api.engineState(),
+    api.getSettings(),
+    api.currentGame(),
+    api.storageStatus().catch(() => null),
+  ]);
+  useApp.setState({ engine, settings, game, storage, status: engine.status });
   void s.refreshClips();
 
   const offs = await Promise.all([
@@ -123,6 +130,9 @@ export async function connect(): Promise<() => void> {
     }),
     listen<Game | null>("game", (e) => useApp.setState({ game: e.payload })),
     listen<Record<string, unknown>>("engine-event", (e) => onEngineEvent(e.payload)),
+    listen<StorageStatus>("storage", (e) => useApp.setState({ storage: e.payload })),
+    // Storage cleanup compressed or recycled clips.
+    listen("library-changed", () => void useApp.getState().refreshClips()),
   ]);
   return () => offs.forEach((off) => off());
 }

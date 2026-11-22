@@ -172,6 +172,37 @@ pub fn probe(path: &Path) -> Result<Probe> {
 }
 
 // ---------------------------------------------------------------------------------------
+// Inspect
+
+#[derive(Serialize)]
+pub struct Inspect {
+    pub duration: f64,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    /// Average bitrate of the whole file (video + all audio tracks), kbps.
+    pub kbps: f64,
+    /// Already compressed by storage cleanup.
+    pub compressed: bool,
+}
+
+/// Header facts only (no decoding), fast enough to run over a whole library.
+pub fn inspect(path: &Path) -> Result<Inspect> {
+    let m = Mp4::open(path)?;
+    let v = m.tracks.iter().find(|t| t.kind == Kind::Video).context("no video track")?;
+    let duration = v.duration_secs();
+    let bytes = std::fs::metadata(path)?.len();
+    Ok(Inspect {
+        duration,
+        width: v.width,
+        height: v.height,
+        fps: v.samples.len() as f64 / duration.max(0.001),
+        kbps: bytes as f64 * 8.0 / 1000.0 / duration.max(0.001),
+        compressed: v.name == mp4::COMPRESSED_VIDEO,
+    })
+}
+
+// ---------------------------------------------------------------------------------------
 // Export
 
 #[derive(Deserialize, Default, Clone)]
@@ -202,6 +233,9 @@ pub struct ExportJob {
     /// Upload limit: if the lossless cut is bigger, re-encode to fit (frame-accurate).
     #[serde(default)]
     pub fit_bytes: Option<u64>,
+    /// Storage cleanup: mark the re-encoded output as compressed (see `mp4::COMPRESSED_VIDEO`).
+    #[serde(default)]
+    pub compressed: bool,
 }
 
 fn yes() -> bool {
@@ -299,6 +333,8 @@ pub fn export(job: &ExportJob, progress: &mut dyn FnMut(&str, f64)) -> Result<Ex
     let base = sel[0].pts;
     let last = sel[sel.len() - 1];
     let (width, height, sps, pps) = (v.width, v.height, v.sps.clone(), v.pps.clone());
+    // A lossless cut of a compressed clip is still compressed.
+    let was_compressed = v.name == mp4::COMPRESSED_VIDEO;
 
     let (_, sources) = layout(&m);
     let keep = job.keep_sources && sources.len() > 1;
@@ -404,6 +440,7 @@ pub fn export(job: &ExportJob, progress: &mut dyn FnMut(&str, f64)) -> Result<Ex
             let stats = mp4::write_mp4(
                 &job.output,
                 &mp4::VideoTrack {
+                    name: if job.compressed || was_compressed { mp4::COMPRESSED_VIDEO } else { mp4::VIDEO },
                     width: plan.width,
                     height: plan.height,
                     fps: plan.fps,
@@ -445,6 +482,7 @@ pub fn export(job: &ExportJob, progress: &mut dyn FnMut(&str, f64)) -> Result<Ex
         let stats = mp4::write_mp4_with(
             &job.output,
             &mp4::VideoTrack {
+                name: if was_compressed { mp4::COMPRESSED_VIDEO } else { mp4::VIDEO },
                 width,
                 height,
                 fps: src_fps,

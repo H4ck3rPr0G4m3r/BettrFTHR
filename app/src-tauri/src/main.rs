@@ -9,6 +9,7 @@ mod games;
 mod library;
 mod settings;
 mod sound;
+mod storage;
 
 use engine::Engine;
 use parking_lot::Mutex;
@@ -35,6 +36,7 @@ struct AppState {
     engine: Engine,
     game: Mutex<Option<games::Game>>,
     detection_on: Arc<AtomicBool>,
+    storage: storage::Storage,
 }
 
 impl AppState {
@@ -113,6 +115,7 @@ fn set_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> R
         state.engine.restart();
     }
     state.engine.set_wanted(state.wants_engine());
+    state.storage.kick();
     Ok(new)
 }
 
@@ -155,6 +158,17 @@ fn rename_clip(state: State<AppState>, path: PathBuf, title: String) -> Res<Path
     let root = state.settings.lock().out_dir.clone();
     library::ensure_inside(&root, &path).map_err(err)?;
     library::rename(&path, &title).map_err(err)
+}
+
+#[tauri::command]
+fn storage_status(state: State<AppState>) -> storage::Status {
+    state.storage.status()
+}
+
+/// "Check now": runs a pass right away (it still only acts above the limit).
+#[tauri::command]
+fn storage_run(state: State<AppState>) {
+    state.storage.kick();
 }
 
 #[tauri::command]
@@ -249,6 +263,7 @@ async fn export_clip(app: AppHandle, state: State<'_, AppState>, req: ExportRequ
         end: req.end,
         sources: req.sources,
         keep_sources: !discord,
+        compressed: false,
         // Decimal MB, a little under Discord's MiB limits, to stay on the safe side.
         fit_bytes: discord.then(|| state.settings.lock().discord_limit_mb as u64 * 1_000_000),
     };
@@ -393,6 +408,7 @@ fn main() {
                 engine,
                 game: Mutex::new(None),
                 detection_on: detection_on.clone(),
+                storage: storage::Storage::start(handle.clone()),
             });
 
             {
@@ -421,6 +437,9 @@ fn main() {
                         let s = h.state::<AppState>().settings.lock().clone();
                         (s.save_sound, s.sound_style, s.sound_volume)
                     };
+                    if matches!(kind, "clip_saved" | "recording_stopped") {
+                        h.state::<AppState>().storage.kick();
+                    }
                     let cue = match kind {
                         "clip_saved" => sound::Cue::Saved,
                         "recording_started" => sound::Cue::RecordStart,
@@ -478,6 +497,8 @@ fn main() {
             probe_clip,
             export_clip,
             list_audio_devices,
+            storage_status,
+            storage_run,
         ])
         .build(tauri::generate_context!())
         .expect("build tauri app")
