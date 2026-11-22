@@ -1,13 +1,13 @@
 //! Keeps the clip library under a size limit (Settings > Storage).
 //!
-//! When the library is over the limit, the oldest clips are first re-encoded smaller (each
-//! clip once; the engine marks the file, so a renamed clip is still recognized). If that is
-//! not enough, or compression is off, the oldest clips go to the Recycle Bin until the
-//! library fits. Clips saved in the last few minutes and the recording in progress are never
+//! When the library is over the limit, the oldest clips are re-encoded smaller (each clip
+//! once; the engine marks the file, so a renamed clip is still recognized), but only the N
+//! oldest. When those are all compressed and it's still not enough, the oldest clip goes to
+//! the Recycle Bin and the next one in line gets compressed, until the library fits. Clips saved in the last few minutes and the recording in progress are never
 //! touched, and compression waits while a game runs so it never costs frames.
 
 use crate::library::{self, Clip};
-use crate::{AppState, editor};
+use crate::{AppState, editor, settings};
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -118,6 +118,174 @@ fn marker(c: &Clip, thumbs: &Path) -> Option<PathBuf> {
     library::cache_path(&c.path, thumbs, "nocompress")
 }
 
+/// What `run` needs from the outside world; faked in the tests.
+trait Ops {
+    /// Current settings (they may change during a long pass).
+    fn settings(&self) -> settings::Storage;
+    fn game_running(&self) -> bool;
+    /// Could compressing this clip still shrink it? (Not already compressed, not tiny.)
+    fn can_compress(&mut self, c: &Clip) -> bool;
+    /// New size, or `None` if it would not have saved enough (then it counts as done).
+    fn compress(&mut self, c: &Clip) -> Result<Option<u64>, String>;
+    fn recycle(&mut self, paths: &[PathBuf]) -> bool;
+}
+
+#[derive(Default)]
+struct Outcome {
+    act: Activity,
+    waiting_for_game: bool,
+}
+
+/// One cleanup pass over `list` (oldest first, only clips we may touch); `used` is the
+/// whole library's size.
+///
+/// Only the `compress_oldest` oldest clips are ever compressed. When all of those are
+/// compressed and space is still short, the oldest clip goes to the Recycle Bin, which brings
+/// the next clip into that window to be compressed, and so on until the library fits.
+fn run(ops: &mut impl Ops, mut list: Vec<Clip>, mut used: u64, limit: u64) -> Outcome {
+    let mut out = Outcome::default();
+    let mut done: HashSet<PathBuf> = HashSet::new();
+    while used > limit && !list.is_empty() {
+        let cfg = ops.settings();
+        if !cfg.enabled {
+            break;
+        }
+        if cfg.compress {
+            let window = list.len().min(cfg.compress_oldest.max(1) as usize);
+            let next = (0..window).find(|&i| !done.contains(&list[i].path) && {
+                let ok = ops.can_compress(&list[i]);
+                if !ok {
+                    done.insert(list[i].path.clone());
+                }
+                ok
+            });
+            if let Some(i) = next {
+                // Recycling a clip that could still be compressed (once the game closes)
+                // would throw it away early: everything waits.
+                if ops.game_running() {
+                    out.waiting_for_game = true;
+                    break;
+                }
+                done.insert(list[i].path.clone());
+                match ops.compress(&list[i]) {
+                    Ok(Some(bytes)) => {
+                        let saved = list[i].bytes.saturating_sub(bytes);
+                        used = used.saturating_sub(saved);
+                        list[i].bytes = bytes;
+                        out.act.compressed += 1;
+                        out.act.saved_bytes += saved;
+                    }
+                    Ok(None) | Err(_) => {}
+                }
+                continue;
+            }
+        }
+        if !cfg.delete {
+            break;
+        }
+        // Without compression nothing enters a window: recycle everything needed at once.
+        let take = if cfg.compress {
+            1
+        } else {
+            let mut freed = 0;
+            list.iter().take_while(|c| {
+                let need = used - freed > limit;
+                freed += c.bytes;
+                need
+            })
+            .count()
+            .max(1)
+        };
+        let batch: Vec<Clip> = list.drain(..take.min(list.len())).collect();
+        let paths: Vec<PathBuf> = batch.iter().map(|c| c.path.clone()).collect();
+        if !ops.recycle(&paths) {
+            break;
+        }
+        let bytes: u64 = batch.iter().map(|c| c.bytes).sum();
+        used = used.saturating_sub(bytes);
+        out.act.recycled += batch.len() as u32;
+        out.act.recycled_bytes += bytes;
+    }
+    out
+}
+
+struct RealOps<'a> {
+    app: &'a AppHandle,
+    status: &'a Mutex<Status>,
+    failed: &'a mut HashSet<(PathBuf, u64, u64)>,
+    thumbs: PathBuf,
+    exports: PathBuf,
+    /// Inspect results of clips about to be compressed.
+    info: Option<(PathBuf, editor::Inspect)>,
+}
+
+impl Ops for RealOps<'_> {
+    fn settings(&self) -> settings::Storage {
+        self.app.state::<AppState>().settings.lock().storage.clone()
+    }
+
+    fn game_running(&self) -> bool {
+        self.app.state::<AppState>().game.lock().is_some()
+    }
+
+    fn can_compress(&mut self, c: &Clip) -> bool {
+        if self.failed.contains(&key(c)) || marker(c, &self.thumbs).is_some_and(|m| m.is_file()) {
+            return false;
+        }
+        match editor::inspect(&c.path) {
+            Ok(info) if info.compressed || info.duration > MAX_COMPRESS_SECS || info.kbps < MIN_KBPS => {
+                mark(c, &self.thumbs);
+                false
+            }
+            Ok(info) => {
+                self.info = Some((c.path.clone(), info));
+                true
+            }
+            Err(e) => {
+                tracing::warn!(clip = %c.path.display(), "storage: can't read clip: {e}");
+                self.failed.insert(key(c));
+                false
+            }
+        }
+    }
+
+    fn compress(&mut self, c: &Clip) -> Result<Option<u64>, String> {
+        let info = match self.info.take() {
+            Some((p, i)) if p == c.path => i,
+            _ => editor::inspect(&c.path)?,
+        };
+        publish(self.app, self.status, |s| s.busy = Some(format!("Compressing {}", c.title)));
+        let res = compress(c, &info, &self.thumbs, &self.exports);
+        publish(self.app, self.status, |s| s.busy = None);
+        match &res {
+            Ok(Some(bytes)) => {
+                tracing::info!(clip = %c.path.display(), before = c.bytes, after = bytes, "storage: compressed");
+                let _ = self.app.emit("library-changed", ());
+            }
+            Ok(None) => mark(c, &self.thumbs),
+            Err(e) => {
+                tracing::warn!(clip = %c.path.display(), "storage: compression failed: {e}");
+                self.failed.insert(key(c));
+            }
+        }
+        res
+    }
+
+    fn recycle(&mut self, paths: &[PathBuf]) -> bool {
+        match library::recycle(paths) {
+            Ok(()) => {
+                tracing::info!(count = paths.len(), "storage: moved to the Recycle Bin");
+                let _ = self.app.emit("library-changed", ());
+                true
+            }
+            Err(e) => {
+                tracing::warn!("storage: could not move clips to the Recycle Bin: {e:#}");
+                false
+            }
+        }
+    }
+}
+
 fn pass(app: &AppHandle, status: &Mutex<Status>, failed: &mut HashSet<(PathBuf, u64, u64)>) {
     let Some(state) = app.try_state::<AppState>() else { return };
     let (settings, thumbs, exports) = (
@@ -127,116 +295,42 @@ fn pass(app: &AppHandle, status: &Mutex<Status>, failed: &mut HashSet<(PathBuf, 
     );
     let cfg = &settings.storage;
     let limit = cfg.limit_bytes();
-    let scan = || library::scan(&settings.out_dir, &thumbs);
-    let total = |clips: &[Clip]| clips.iter().map(|c| c.bytes).sum::<u64>();
-
-    let mut clips = scan();
-    if !cfg.enabled || total(&clips) <= limit {
+    let clips = library::scan(&settings.out_dir, &thumbs);
+    let used: u64 = clips.iter().map(|c| c.bytes).sum();
+    if !cfg.enabled || used <= limit {
         publish(app, status, |s| s.note = None);
         return;
     }
     let recording = state.engine.state().recording;
-    let touchable = |clips: &[Clip]| -> Vec<Clip> {
-        let now = now_ms();
-        // `scan` lists newest first: walk from the oldest.
-        clips
-            .iter()
-            .rev()
-            .filter(|c| now.saturating_sub(c.modified) > FRESH_MS && Some(&c.path) != recording.as_ref())
-            .cloned()
-            .collect()
+    let now = now_ms();
+    // `scan` lists newest first: walk from the oldest.
+    let list: Vec<Clip> = clips
+        .iter()
+        .rev()
+        .filter(|c| now.saturating_sub(c.modified) > FRESH_MS && Some(&c.path) != recording.as_ref())
+        .cloned()
+        .collect();
+    let mut ops = RealOps {
+        app,
+        status,
+        failed,
+        thumbs: thumbs.clone(),
+        exports,
+        info: None,
     };
+    let Outcome { mut act, waiting_for_game } = run(&mut ops, list, used, limit);
 
-    let mut act = Activity::default();
-    let mut waiting_for_game = false;
-    if cfg.compress {
-        let mut used = total(&clips);
-        for c in touchable(&clips) {
-            if used <= limit {
-                break;
-            }
-            // Settings may change during a long pass.
-            let now_cfg = state.settings.lock().storage.clone();
-            if !now_cfg.enabled || !now_cfg.compress {
-                break;
-            }
-            if failed.contains(&key(&c)) || marker(&c, &thumbs).is_some_and(|m| m.is_file()) {
-                continue;
-            }
-            if state.game.lock().is_some() {
-                waiting_for_game = true;
-                break;
-            }
-            let info = match editor::inspect(&c.path) {
-                Ok(i) => i,
-                Err(e) => {
-                    tracing::warn!(clip = %c.path.display(), "storage: can't read clip: {e}");
-                    failed.insert(key(&c));
-                    continue;
-                }
-            };
-            if info.compressed || info.duration > MAX_COMPRESS_SECS || info.kbps < MIN_KBPS {
-                mark(&c, &thumbs);
-                continue;
-            }
-            publish(app, status, |s| s.busy = Some(format!("Compressing {}", c.title)));
-            match compress(&c, &info, &thumbs, &exports) {
-                Ok(Some(bytes)) => {
-                    let saved = c.bytes.saturating_sub(bytes);
-                    tracing::info!(clip = %c.path.display(), before = c.bytes, after = bytes, "storage: compressed");
-                    used = used.saturating_sub(saved);
-                    act.compressed += 1;
-                    act.saved_bytes += saved;
-                    let _ = app.emit("library-changed", ());
-                }
-                Ok(None) => mark(&c, &thumbs),
-                Err(e) => {
-                    tracing::warn!(clip = %c.path.display(), "storage: compression failed: {e}");
-                    failed.insert(key(&c));
-                }
-            }
-        }
-        publish(app, status, |s| s.busy = None);
-        clips = scan();
-    }
-
-    // Deleting a clip that compression could still shrink (once the game closes) would be
-    // throwing it away early, so deletion waits too in that case.
-    let still_on = state.settings.lock().storage.clone();
-    if still_on.enabled && still_on.delete && !waiting_for_game && total(&clips) > limit {
-        let mut used = total(&clips);
-        let mut batch = Vec::new();
-        for c in touchable(&clips) {
-            if used <= limit {
-                break;
-            }
-            used -= c.bytes;
-            act.recycled_bytes += c.bytes;
-            batch.push(c.path.clone());
-        }
-        if !batch.is_empty() {
-            match library::recycle(&batch) {
-                Ok(()) => {
-                    tracing::info!(count = batch.len(), bytes = act.recycled_bytes, "storage: moved to the Recycle Bin");
-                    act.recycled = batch.len() as u32;
-                    let _ = app.emit("library-changed", ());
-                }
-                Err(e) => {
-                    tracing::warn!("storage: could not move clips to the Recycle Bin: {e:#}");
-                    act.recycled_bytes = 0;
-                }
-            }
-        }
-        clips = scan();
-    }
-
-    let over = total(&clips) > limit;
-    let note = if !over {
+    let over = library::scan(&settings.out_dir, &thumbs).iter().map(|c| c.bytes).sum::<u64>() > limit;
+    let cfg = state.settings.lock().storage.clone();
+    let note = if !over || !cfg.enabled {
         None
     } else if waiting_for_game {
         Some("Compressing waits until you close the game.".to_string())
     } else if !cfg.delete {
-        Some("Still over the limit: nothing left that compressing would shrink.".to_string())
+        Some(format!(
+            "Still over the limit: the {} oldest are as small as they get. Raise that number or turn on the Recycle Bin.",
+            cfg.compress_oldest
+        ))
     } else {
         Some("Still over the limit: what's left was saved in the last 10 minutes.".to_string())
     };
@@ -301,4 +395,127 @@ fn compress(c: &Clip, info: &editor::Inspect, thumbs: &Path, exports: &Path) -> 
         return fail(format!("replace the original: {e}"));
     }
     Ok(Some(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 100-byte clips that compress to 50, no game running.
+    struct Fake {
+        cfg: settings::Storage,
+        log: Vec<String>,
+        compressed: HashSet<PathBuf>,
+        game: bool,
+    }
+
+    impl Ops for Fake {
+        fn settings(&self) -> settings::Storage {
+            self.cfg.clone()
+        }
+        fn game_running(&self) -> bool {
+            self.game
+        }
+        fn can_compress(&mut self, c: &Clip) -> bool {
+            !self.compressed.contains(&c.path)
+        }
+        fn compress(&mut self, c: &Clip) -> Result<Option<u64>, String> {
+            self.compressed.insert(c.path.clone());
+            self.log.push(format!("compress {}", c.title));
+            Ok(Some(c.bytes / 2))
+        }
+        fn recycle(&mut self, paths: &[PathBuf]) -> bool {
+            for p in paths {
+                self.log.push(format!("recycle {}", p.display()));
+            }
+            true
+        }
+    }
+
+    fn clips(n: usize) -> Vec<Clip> {
+        (1..=n)
+            .map(|i| Clip {
+                path: PathBuf::from(i.to_string()),
+                title: i.to_string(),
+                game: None,
+                kind: "clip",
+                bytes: 100,
+                modified: i as u64,
+                duration: None,
+                thumb: None,
+            })
+            .collect()
+    }
+
+    fn fake(compress: bool, delete: bool, compress_oldest: u32) -> Fake {
+        Fake {
+            cfg: settings::Storage {
+                enabled: true,
+                limit_gb: 1.0,
+                compress,
+                delete,
+                compress_oldest,
+            },
+            log: Vec::new(),
+            compressed: HashSet::new(),
+            game: false,
+        }
+    }
+
+    #[test]
+    fn compresses_the_window_then_alternates_recycle_and_compress() {
+        // 20 clips, 2000 bytes, limit 1400, only the 5 oldest may be compressed.
+        let mut f = fake(true, true, 5);
+        let out = run(&mut f, clips(20), 2000, 1400);
+        let expect = [
+            "compress 1", "compress 2", "compress 3", "compress 4", "compress 5", // 1750
+            "recycle 1", "compress 6", // 1700, 1650
+            "recycle 2", "compress 7", // 1600, 1550
+            "recycle 3", "compress 8", // 1500, 1450
+            "recycle 4",               // 1400: fits
+        ];
+        assert_eq!(f.log, expect);
+        assert_eq!((out.act.compressed, out.act.recycled), (8, 4));
+        assert_eq!(out.act.saved_bytes, 400);
+    }
+
+    #[test]
+    fn stops_once_it_fits() {
+        let mut f = fake(true, true, 10);
+        run(&mut f, clips(20), 2000, 1900);
+        assert_eq!(f.log, ["compress 1", "compress 2"]);
+    }
+
+    #[test]
+    fn without_recycling_only_the_window_is_compressed() {
+        let mut f = fake(true, false, 3);
+        run(&mut f, clips(20), 2000, 1000);
+        assert_eq!(f.log, ["compress 1", "compress 2", "compress 3"]);
+    }
+
+    #[test]
+    fn without_compression_recycles_the_oldest_at_once() {
+        let mut f = fake(false, true, 10);
+        let out = run(&mut f, clips(20), 2000, 1750);
+        assert_eq!(f.log, ["recycle 1", "recycle 2", "recycle 3"]);
+        assert_eq!(out.act.recycled_bytes, 300);
+    }
+
+    #[test]
+    fn already_compressed_clips_are_not_counted_twice() {
+        let mut f = fake(true, true, 2);
+        f.compressed.insert(PathBuf::from("1"));
+        run(&mut f, clips(5), 500, 400);
+        // 1 is done already, 2 is compressed (450); then 1 goes (350).
+        assert_eq!(f.log, ["compress 2", "recycle 1"]);
+    }
+
+    #[test]
+    fn a_running_game_pauses_everything() {
+        let mut f = fake(true, true, 5);
+        f.game = true;
+        let out = run(&mut f, clips(20), 2000, 1000);
+        assert!(f.log.is_empty());
+        assert!(out.waiting_for_game);
+    }
 }

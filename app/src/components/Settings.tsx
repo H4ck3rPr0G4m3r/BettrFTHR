@@ -364,8 +364,6 @@ function StorageSection({ draft, set }: { draft: S; set: <K extends keyof S>(k: 
   const toast = useApp((s) => s.toast);
   const st = draft.storage;
   const update = (patch: Partial<S["storage"]>) => set("storage", { ...st, ...patch });
-  const [limitText, setLimitText] = useState(String(st.limit_gb));
-  useEffect(() => setLimitText(String(st.limit_gb)), [st.limit_gb]);
 
   const used = clips.reduce((n, c) => n + c.bytes, 0);
   const limit = st.limit_gb * GiB;
@@ -376,11 +374,6 @@ function StorageSection({ draft, set }: { draft: S; set: <K extends keyof S>(k: 
   const off = !st.enabled;
   const last = status?.last;
 
-  const commitLimit = () => {
-    const v = Number(limitText.replace(",", "."));
-    if (Number.isFinite(v) && v >= 1) update({ limit_gb: Math.round(v * 10) / 10 });
-    else setLimitText(String(st.limit_gb));
-  };
 
   return (
     <Section title="Storage">
@@ -421,19 +414,14 @@ function StorageSection({ draft, set }: { draft: S; set: <K extends keyof S>(k: 
       </Row>
       <div className={cx("divide-y divide-line/70 transition-opacity", off && "pointer-events-none opacity-40")} aria-disabled={off}>
         <Row title="Size limit" help="Everything in the clip folder counts, recordings included.">
-          <label className="flex items-center gap-2">
-            <input
-              type="text"
-              inputMode="decimal"
-              value={limitText}
-              onChange={(e) => setLimitText(e.target.value)}
-              onBlur={commitLimit}
-              onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
-              aria-label="Size limit in GB"
-              className="h-8 w-20 rounded-ctl border border-line bg-raised px-2.5 text-right font-mono text-[13px] outline-none focus:border-line-strong"
-            />
-            <span className="font-mono text-[12.5px] text-muted">GB</span>
-          </label>
+          <NumberField
+            label="Size limit in GB"
+            value={st.limit_gb}
+            min={1}
+            decimals={1}
+            suffix="GB"
+            onCommit={(v) => update({ limit_gb: v })}
+          />
         </Row>
         <Row
           title="Compress the oldest clips first"
@@ -441,6 +429,24 @@ function StorageSection({ draft, set }: { draft: S; set: <K extends keyof S>(k: 
         >
           <Toggle label="Compress the oldest clips first" checked={st.compress} onChange={(v) => update({ compress: v })} />
         </Row>
+        <div className={cx("transition-opacity", !st.compress && "pointer-events-none opacity-40")} aria-disabled={!st.compress}>
+          <Row
+            title="How many to compress"
+            help={
+              st.delete
+                ? `Only the ${st.compress_oldest} oldest are compressed. When that isn't enough, the oldest goes to the Recycle Bin and the next one in line is compressed, until it fits.`
+                : `Only the ${st.compress_oldest} oldest are compressed.`
+            }
+          >
+            <NumberField
+              label="How many of the oldest clips to compress"
+              value={st.compress_oldest}
+              min={1}
+              suffix={st.compress_oldest === 1 ? "clip" : "clips"}
+              onCommit={(v) => update({ compress_oldest: v })}
+            />
+          </Row>
+        </div>
         <Row
           title="Then move the oldest to the Recycle Bin"
           help="When compressing isn't enough. Clips from the last 10 minutes are never touched."
@@ -454,6 +460,50 @@ function StorageSection({ draft, set }: { draft: S; set: <K extends keyof S>(k: 
         )}
       </div>
     </Section>
+  );
+}
+
+/** Text field for a number: typing is free, the value is checked when leaving the field. */
+function NumberField({
+  label,
+  value,
+  min,
+  decimals = 0,
+  suffix,
+  onCommit,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  decimals?: number;
+  suffix: string;
+  onCommit: (v: number) => void;
+}) {
+  const [text, setText] = useState(String(value));
+  useEffect(() => setText(String(value)), [value]);
+  const commit = () => {
+    const v = Number(text.trim().replace(",", "."));
+    const f = 10 ** decimals;
+    if (Number.isFinite(v) && v >= min) {
+      const r = Math.round(v * f) / f;
+      onCommit(r);
+      setText(String(r));
+    } else setText(String(value));
+  };
+  return (
+    <label className="flex items-center gap-2">
+      <input
+        type="text"
+        inputMode={decimals ? "decimal" : "numeric"}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
+        aria-label={label}
+        className="h-8 w-20 rounded-ctl border border-line bg-raised px-2.5 text-right font-mono text-[13px] outline-none focus:border-line-strong"
+      />
+      <span className="w-9 font-mono text-[12.5px] text-muted">{suffix}</span>
+    </label>
   );
 }
 

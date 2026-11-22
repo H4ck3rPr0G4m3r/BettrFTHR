@@ -65,6 +65,9 @@ pub struct Storage {
     pub limit_gb: f64,
     /// First re-encode the oldest clips smaller (each clip only once).
     pub compress: bool,
+    /// Only this many of the oldest clips are compressed; beyond that the oldest is recycled
+    /// and the next one in line takes its place.
+    pub compress_oldest: u32,
     /// Then, if that is not enough, move the oldest clips to the Recycle Bin.
     pub delete: bool,
 }
@@ -76,6 +79,7 @@ impl Default for Storage {
             limit_gb: 50.0,
             compress: true,
             delete: true,
+            compress_oldest: 10,
         }
     }
 }
@@ -199,6 +203,7 @@ impl Settings {
             self.storage.limit_gb = Storage::default().limit_gb;
         }
         self.storage.limit_gb = ((self.storage.limit_gb * 10.0).round() / 10.0).clamp(1.0, 100_000.0);
+        self.storage.compress_oldest = self.storage.compress_oldest.clamp(1, 100_000);
         for a in &mut self.audio {
             a.gain = a.gain.clamp(0.0, 4.0);
         }
@@ -257,6 +262,7 @@ mod tests {
         let s = s.sanitized();
         assert!(s.storage.enabled && s.storage.compress && s.storage.delete);
         assert_eq!(s.storage.limit_gb, 1.0);
+        assert_eq!(s.storage.compress_oldest, 10);
     }
 
     #[test]

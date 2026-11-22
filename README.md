@@ -15,7 +15,7 @@ with a Rust capture engine and a focus on stability over features. See
   precise timeline and a filmstrip of the other clips, editor (trim, mute or turn down each
   audio source, mute sections), copy for Discord that compresses to your upload limit,
   settings (length, fps, resolution, quality, hotkeys incl. F13-F24, audio sources with live
-  level meters), a storage limit that compresses the oldest clips and then moves the oldest to
+  level meters), a storage limit that compresses the N oldest clips, then alternates moving the oldest to
   the Recycle Bin (opt-in, Settings > Storage),
   game detection, tray, installer, start with Windows.
 

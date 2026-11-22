@@ -17,6 +17,8 @@ export interface StorageSettings {
   limit_gb: number;
   /** First re-encode the oldest clips smaller. */
   compress: boolean;
+  /** Only this many of the oldest are compressed; past that the oldest is recycled. */
+  compress_oldest: number;
   /** Then move the oldest clips to the Recycle Bin. */
   delete: boolean;
 }
