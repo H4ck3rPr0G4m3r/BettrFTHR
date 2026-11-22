@@ -241,7 +241,7 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bettr-app"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "anyhow",
  "parking_lot",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "bettr-engine"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
