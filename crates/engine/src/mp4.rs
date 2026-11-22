@@ -16,7 +16,13 @@ pub const VIDEO_TIMESCALE: u32 = 90_000;
 const MOVIE_TIMESCALE: u32 = 1000;
 pub const AAC_FRAME: u32 = 1024;
 
+/// Handler name of the video track. Storage cleanup writes `COMPRESSED_VIDEO` instead, so a
+/// clip it already compressed is recognized (also after a rename) and never squeezed twice.
+pub const VIDEO: &str = "Video";
+pub const COMPRESSED_VIDEO: &str = "Video (compressed)";
+
 pub struct VideoTrack<'a> {
+    pub name: &'a str,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -277,7 +283,7 @@ fn build_moov(
             track_header(w, 1, 3, movie_dur, 0, false, video.width, video.height);
             w.boxed(b"mdia", |w| {
                 media_header(w, VIDEO_TIMESCALE, vt.total_duration);
-                handler(w, b"vide", "Video");
+                handler(w, b"vide", video.name);
                 w.boxed(b"minf", |w| {
                     w.full(b"vmhd", 0, 1, |w| w.zeros(8));
                     data_info(w);
@@ -738,6 +744,7 @@ mod tests {
         let stats = write_mp4(
             &path,
             &VideoTrack {
+                name: VIDEO,
                 width: 1920,
                 height: 1080,
                 fps: 60,

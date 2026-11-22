@@ -112,6 +112,7 @@ fn run(
         })
         .collect();
     let video_info = mp4::VideoTrack {
+        name: mp4::VIDEO,
         width: src.width,
         height: src.height,
         fps: src.fps,

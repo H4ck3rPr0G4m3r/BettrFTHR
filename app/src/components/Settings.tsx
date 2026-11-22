@@ -1,7 +1,8 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Microphone, Play, Plus, SpeakerHigh, Trash, Warning } from "@phosphor-icons/react";
-import { api, errorText, type AudioDevice, type AudioSource, type Settings as S, type SourceKind } from "../lib/api";
+import { api, errorText, type AudioDevice, type AudioSource, type Settings as S, type SourceKind, type StorageStatus } from "../lib/api";
+import { formatBytes, formatDateTime } from "../lib/format";
 import { useApp } from "../lib/store";
 import { captureHotkey } from "../lib/hotkey";
 import { PANEL, SIDEBAR, useLayout } from "../lib/layout";
@@ -158,6 +159,8 @@ export function Settings() {
               </div>
             </Row>
           </Section>
+
+          <StorageSection draft={draft} set={set} />
 
           <Section title="Discord">
             <Row
@@ -349,6 +352,157 @@ function AppearanceSection() {
         </Button>
       </Row>
     </Section>
+  );
+}
+
+const GiB = 1024 ** 3;
+
+function StorageSection({ draft, set }: { draft: S; set: <K extends keyof S>(k: K, v: S[K]) => void }) {
+  const clips = useApp((s) => s.clips);
+  const status = useApp((s) => s.storage);
+  const saved = useApp((s) => s.settings);
+  const toast = useApp((s) => s.toast);
+  const st = draft.storage;
+  const update = (patch: Partial<S["storage"]>) => set("storage", { ...st, ...patch });
+  const [limitText, setLimitText] = useState(String(st.limit_gb));
+  useEffect(() => setLimitText(String(st.limit_gb)), [st.limit_gb]);
+
+  const used = clips.reduce((n, c) => n + c.bytes, 0);
+  const limit = st.limit_gb * GiB;
+  const over = st.enabled && used > limit;
+  // The bar's full width is the larger of the two, so going over the limit stays visible.
+  const scale = Math.max(used, st.enabled ? limit : used, 1);
+  const pct = (v: number) => `${(v / scale) * 100}%`;
+  const off = !st.enabled;
+  const last = status?.last;
+
+  const commitLimit = () => {
+    const v = Number(limitText.replace(",", "."));
+    if (Number.isFinite(v) && v >= 1) update({ limit_gb: Math.round(v * 10) / 10 });
+    else setLimitText(String(st.limit_gb));
+  };
+
+  return (
+    <Section title="Storage">
+      <div className="py-3.5">
+        <div className="flex items-baseline justify-between gap-4 font-mono text-[12px]">
+          <span className={over ? "text-warn" : "text-muted"}>
+            {formatBytes(used)} in {clips.length} {clips.length === 1 ? "clip" : "clips"}
+          </span>
+          <span className="text-faint">{st.enabled ? `limit ${formatBytes(limit)}` : "no limit"}</span>
+        </div>
+        <div
+          className="relative mt-2 h-2 overflow-hidden rounded-full bg-line"
+          role="meter"
+          aria-label="Library size"
+          aria-valuemin={0}
+          aria-valuemax={st.enabled ? limit : used}
+          aria-valuenow={used}
+        >
+          <span
+            className={cx("absolute inset-y-0 left-0 transition-[width] duration-500 ease-out-quint", off ? "bg-faint" : "bg-accent")}
+            style={{ width: pct(st.enabled ? Math.min(used, limit) : used) }}
+          />
+          {over && (
+            <span
+              className="absolute inset-y-0 bg-warn transition-[width,left] duration-500 ease-out-quint"
+              style={{ left: pct(limit), width: pct(used - limit) }}
+            />
+          )}
+          {st.enabled && used > 0 && <span className="absolute inset-y-0 w-[2px] bg-bg" style={{ left: pct(limit) }} />}
+        </div>
+        <StorageActivityLine status={status} enabled={!!saved?.storage.enabled} last={last} onRun={() =>
+          api.storageRun().catch((e) => toast({ tone: "error", title: "Could not start the cleanup", body: errorText(e) }))
+        } />
+      </div>
+
+      <Row title="Keep the library under a size limit" help="When it grows past the limit, the oldest clips make room. Off by default.">
+        <Toggle label="Keep the library under a size limit" checked={st.enabled} onChange={(v) => update({ enabled: v })} />
+      </Row>
+      <div className={cx("divide-y divide-line/70 transition-opacity", off && "pointer-events-none opacity-40")} aria-disabled={off}>
+        <Row title="Size limit" help="Everything in the clip folder counts, recordings included.">
+          <label className="flex items-center gap-2">
+            <input
+              type="text"
+              inputMode="decimal"
+              value={limitText}
+              onChange={(e) => setLimitText(e.target.value)}
+              onBlur={commitLimit}
+              onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
+              aria-label="Size limit in GB"
+              className="h-8 w-20 rounded-ctl border border-line bg-raised px-2.5 text-right font-mono text-[13px] outline-none focus:border-line-strong"
+            />
+            <span className="font-mono text-[12.5px] text-muted">GB</span>
+          </label>
+        </Row>
+        <Row
+          title="Compress the oldest clips first"
+          help="Re-encodes them to about 40% of their size (1080p becomes 720p). Each clip only once, and only while no game is running."
+        >
+          <Toggle label="Compress the oldest clips first" checked={st.compress} onChange={(v) => update({ compress: v })} />
+        </Row>
+        <Row
+          title="Then move the oldest to the Recycle Bin"
+          help="When compressing isn't enough. Clips from the last 10 minutes are never touched."
+        >
+          <Toggle label="Then move the oldest to the Recycle Bin" checked={st.delete} onChange={(v) => update({ delete: v })} />
+        </Row>
+        {st.enabled && !st.compress && !st.delete && (
+          <p className="flex items-center gap-2 py-3 text-[12.5px] text-warn">
+            <Warning size={15} /> Both are off, so nothing happens when the limit is reached.
+          </p>
+        )}
+      </div>
+    </Section>
+  );
+}
+
+function StorageActivityLine({
+  status,
+  enabled,
+  last,
+  onRun,
+}: {
+  status: StorageStatus | null;
+  enabled: boolean;
+  last: StorageStatus["last"] | undefined;
+  onRun: () => void;
+}) {
+  let line: ReactNode = null;
+  if (status?.busy) {
+    line = (
+      <span className="flex min-w-0 items-center gap-2 text-muted">
+        <span className="anim-rec size-1.5 shrink-0 rounded-full bg-accent" />
+        <span className="truncate">{status.busy}</span>
+      </span>
+    );
+  } else if (status?.note) {
+    line = (
+      <span className="flex min-w-0 items-center gap-2 text-warn">
+        <Warning size={14} className="shrink-0" />
+        <span className="truncate">{status.note}</span>
+      </span>
+    );
+  } else if (last) {
+    const parts = [];
+    if (last.compressed) parts.push(`compressed ${last.compressed} (saved ${formatBytes(last.saved_bytes)})`);
+    if (last.recycled) parts.push(`moved ${last.recycled} to the Recycle Bin (${formatBytes(last.recycled_bytes)})`);
+    line = (
+      <span className="truncate text-faint">
+        {formatDateTime(last.at)}: {parts.join(", ")}
+      </span>
+    );
+  }
+  if (!line && !enabled) return null;
+  return (
+    <div className="mt-2.5 flex min-h-7 items-center justify-between gap-4 text-[12.5px]">
+      <div className="min-w-0">{line}</div>
+      {enabled && (
+        <Button size="sm" variant="ghost" onClick={onRun} disabled={!!status?.busy}>
+          Check now
+        </Button>
+      )}
+    </div>
   );
 }
 

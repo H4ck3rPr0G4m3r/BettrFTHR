@@ -1,7 +1,7 @@
 import { useMemo } from "react";
-import { FilmStrip, GearSix, Record as RecordIcon, VideoCamera } from "@phosphor-icons/react";
+import { FilmStrip, GearSix, Microphone, Record as RecordIcon, SpeakerHigh, VideoCamera } from "@phosphor-icons/react";
 import { useApp, type Filter } from "../lib/store";
-import { api, errorText } from "../lib/api";
+import { api, errorText, type AudioSourceStatus } from "../lib/api";
 import { formatDuration } from "../lib/format";
 import { Button, Combo, GameTile, cx } from "./ui";
 import { ResizeHandle } from "./ResizeHandle";
@@ -154,6 +154,58 @@ function BufferMeter({ buffered, target }: { buffered: number; target: number })
   );
 }
 
+/** Peak level to meter segments: -54..0 dBFS across 9 segments, 6 dB each. */
+const LEVEL_SEGMENTS = 9;
+function levelSegments(level: number) {
+  if (level <= 0) return 0;
+  const db = 20 * Math.log10(level);
+  return Math.max(0, Math.min(LEVEL_SEGMENTS, Math.ceil((db + 54) / 6)));
+}
+
+function AudioMeters({ sources }: { sources: AudioSourceStatus[] }) {
+  if (!sources.length) return null;
+  return (
+    <ul className="mt-3 flex flex-col gap-1.5" aria-label="Audio sources">
+      {sources.map((s) => {
+        const Icon = s.kind === "output" ? SpeakerHigh : Microphone;
+        const lit = levelSegments(s.level ?? 0);
+        const problem = s.health === "no_signal" ? "No signal" : s.health === "unavailable" ? "Not connected" : null;
+        return (
+          <li
+            key={s.track}
+            className="flex min-w-0 items-center gap-2 text-[12px]"
+            title={
+              s.health === "no_signal"
+                ? `${s.device}: only silence is coming in. Check that it isn't muted in Windows and is plugged into the jack you picked.`
+                : s.device || "Not connected"
+            }
+          >
+            <Icon size={13} className={problem ? "shrink-0 text-warn" : "shrink-0 text-faint"} />
+            <span className={cx("min-w-0 flex-1 truncate", problem ? "text-fg" : "text-muted")}>{s.track}</span>
+            {problem ? (
+              <span className={cx("shrink-0 text-[11.5px]", s.health === "no_signal" ? "text-warn" : "text-faint")}>
+                {problem}
+              </span>
+            ) : (
+              <span className="flex h-2.5 w-[54px] shrink-0 items-center gap-[2px]" aria-label={`${s.track} level`}>
+                {Array.from({ length: LEVEL_SEGMENTS }, (_, i) => (
+                  <span
+                    key={i}
+                    className={cx(
+                      "h-full flex-1 rounded-[1px] transition-colors duration-150",
+                      i >= lit ? "bg-line" : i >= LEVEL_SEGMENTS - 1 ? "bg-rec" : i >= LEVEL_SEGMENTS - 2 ? "bg-warn" : "bg-accent",
+                    )}
+                  />
+                ))}
+              </span>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
 function CapturePanel() {
   const engine = useApp((s) => s.engine);
   const status = useApp((s) => s.status);
@@ -218,6 +270,7 @@ function CapturePanel() {
       {phase === "running" && (
         <div className="mt-3">
           <BufferMeter buffered={status?.buffered_seconds ?? 0} target={replay} />
+          <AudioMeters sources={status?.audio_sources ?? []} />
         </div>
       )}
 

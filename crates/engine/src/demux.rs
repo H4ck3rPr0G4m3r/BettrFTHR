@@ -528,6 +528,7 @@ mod tests {
         let vp = packets(60, 166_667, 30, 50);
         let ap = packets(94, 213_333, 1, 20);
         let video = VideoTrack {
+            name: crate::mp4::VIDEO,
             width: 1920,
             height: 1080,
             fps: 60,

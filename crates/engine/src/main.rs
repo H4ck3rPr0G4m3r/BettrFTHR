@@ -105,6 +105,8 @@ struct Args {
     list_encoders: bool,
     list_audio: bool,
     selftest_aac: Option<PathBuf>,
+    meter: Option<SourceSpec>,
+    inspect: Option<PathBuf>,
     probe: Option<PathBuf>,
     export: Option<PathBuf>,
 }
@@ -129,6 +131,8 @@ fn parse_args() -> Result<Args> {
         list_encoders: false,
         list_audio: false,
         selftest_aac: None,
+        meter: None,
+        inspect: None,
         probe: None,
         export: None,
     };
@@ -159,8 +163,18 @@ fn parse_args() -> Result<Args> {
             "--list-encoders" => a.list_encoders = true,
             "--list-audio" => a.list_audio = true,
             "--selftest-aac" => a.selftest_aac = Some(PathBuf::from(val()?)),
+            // Diagnostics: `--meter "front panel"` (input) or `--meter out:default` (loopback).
+            "--meter" => {
+                let v = val()?;
+                a.meter = Some(match v.strip_prefix("out:") {
+                    Some(d) => SourceSpec::parse(SourceKind::Output, d)?,
+                    None => SourceSpec::parse(SourceKind::Input, &v)?,
+                });
+            }
             // Editor back end (no capture): waveform/keyframe probe, and export jobs.
             "--probe" => a.probe = Some(PathBuf::from(val()?)),
+            // Quick facts for storage cleanup (no decoding).
+            "--inspect" => a.inspect = Some(PathBuf::from(val()?)),
             "--export" => a.export = Some(PathBuf::from(val()?)),
             "--cli" => {}
             other => anyhow::bail!("unknown argument {other}"),
@@ -396,6 +410,7 @@ fn save_clip(video: &VideoPipeline, audio: Option<&AudioEngine>, seconds: u32, o
                 mp4::write_mp4(
                     &path,
                     &mp4::VideoTrack {
+                        name: mp4::VIDEO,
                         width: snap.width,
                         height: snap.height,
                         fps: snap.fps,
@@ -461,6 +476,10 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if let Some(path) = &args.inspect {
+        println!("{}", serde_json::to_string(&edit::inspect(path)?)?);
+        return Ok(());
+    }
     if let Some(path) = &args.probe {
         println!("{}", serde_json::to_string(&edit::probe(path)?)?);
         return Ok(());
@@ -478,6 +497,9 @@ fn main() -> Result<()> {
         })?;
         emit(json!({"event": "exported", "result": res}));
         return Ok(());
+    }
+    if let Some(spec) = &args.meter {
+        return audio::meter(spec, 6);
     }
     if let Some(path) = &args.selftest_aac {
         audio::selftest_aac(path)?;
@@ -589,7 +611,16 @@ fn main() -> Result<()> {
                         a.shared
                             .tracks
                             .iter()
-                            .map(|t| json!({"track": t.name, "kind": t.spec.kind, "device": *t.device.lock()}))
+                            .map(|t| {
+                                json!({
+                                    "track": t.name,
+                                    "kind": t.spec.kind,
+                                    "device": *t.device.lock(),
+                                    "health": *t.health.lock(),
+                                    // Peak since the last status, 0..1, after the source's gain.
+                                    "level": (t.take_peak() * t.spec.gain).min(1.0),
+                                })
+                            })
                             .collect()
                     })
                     .unwrap_or_default();

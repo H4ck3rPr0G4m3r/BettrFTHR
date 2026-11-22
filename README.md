@@ -14,7 +14,9 @@ with a Rust capture engine and a focus on stability over features. See
 - **App**: library grouped by game and day with multi-select delete, clip view with a
   precise timeline and a filmstrip of the other clips, editor (trim, mute or turn down each
   audio source, mute sections), copy for Discord that compresses to your upload limit,
-  settings (length, fps, resolution, quality, hotkeys incl. F13-F24, audio sources),
+  settings (length, fps, resolution, quality, hotkeys incl. F13-F24, audio sources with live
+  level meters), a storage limit that compresses the oldest clips and then moves the oldest to
+  the Recycle Bin (opt-in, Settings > Storage),
   game detection, tray, installer, start with Windows.
 
 ## Running the app
@@ -52,6 +54,7 @@ Useful flags:
 bettr-engine --seconds 60 --out D:\Clips          # longer replay, other folder
 bettr-engine --height 1080 --bitrate 25000         # downscale 1440p → 1080p, 25 Mbps
 bettr-engine --list-audio                          # show audio devices
+bettr-engine --meter "front panel"                 # 6 s of level + timestamp health for one mic
 bettr-engine --output default --input "Shure" --input "Line 1@0.7"   # several mics, per-source gain
 bettr-engine --config settings.json                # everything from a JSON file (see main.rs)
 ```
