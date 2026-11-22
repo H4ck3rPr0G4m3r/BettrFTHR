@@ -20,7 +20,8 @@
         "decorations": false,
         "center": true,
         "backgroundColor": "#0d0e10",
-        "visible": false
+        "visible": false,
+        "create": false
       }
     ],
     "security": {

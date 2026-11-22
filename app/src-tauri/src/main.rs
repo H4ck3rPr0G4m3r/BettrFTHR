@@ -308,12 +308,28 @@ async fn list_audio_devices() -> Res<Vec<Value>> {
 
 // ---------------------------------------------------------------------------------------
 
+/// Opens the main window, creating its webview if needed. While the app sits in the tray the
+/// window doesn't exist at all: a hidden WebView2 still costs ~200 MB across its processes and
+/// keeps rendering the 1 Hz engine status, so it is destroyed on close and rebuilt here.
 fn show_main(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
-        let _ = w.unminimize();
-        let _ = w.show();
-        let _ = w.set_focus();
-    }
+    let w = match app.get_webview_window("main") {
+        Some(w) => w,
+        None => {
+            let Some(cfg) = app.config().app.windows.iter().find(|w| w.label == "main") else {
+                return;
+            };
+            match tauri::WebviewWindowBuilder::from_config(app, cfg).and_then(|b| b.build()) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::error!("create main window: {e}");
+                    return;
+                }
+            }
+        }
+    };
+    let _ = w.unminimize();
+    let _ = w.show();
+    let _ = w.set_focus();
 }
 
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
@@ -454,12 +470,8 @@ fn main() {
 
             apply_autostart(&handle, app.state::<AppState>().settings.lock().start_with_windows);
             build_tray(app)?;
-            // The window starts hidden (no white flash); started with Windows it stays in the tray.
-            if std::env::args().any(|a| a == "--minimized") {
-                if let Some(w) = handle.get_webview_window("main") {
-                    let _ = w.hide();
-                }
-            } else {
+            // Started with Windows it stays in the tray, without a webview until opened.
+            if !std::env::args().any(|a| a == "--minimized") {
                 show_main(&handle);
             }
             Ok(())
@@ -468,10 +480,10 @@ fn main() {
             if let WindowEvent::CloseRequested { api, .. } = ev {
                 let app = window.app_handle();
                 let state = app.state::<AppState>();
-                if state.settings.lock().close_to_tray {
+                // Close to tray: let the window (and its webview) be destroyed; the run loop
+                // below keeps the app alive in the tray.
+                if !state.settings.lock().close_to_tray {
                     api.prevent_close();
-                    let _ = window.hide();
-                } else {
                     state.engine.shutdown();
                     app.exit(0);
                 }
@@ -503,8 +515,13 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("build tauri app")
         .run(|app, ev| {
-            if let tauri::RunEvent::ExitRequested { .. } = ev {
-                app.state::<AppState>().engine.shutdown();
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = ev {
+                // No code: the last window closed (closed to the tray). Explicit exits carry one.
+                if code.is_none() {
+                    api.prevent_exit();
+                } else {
+                    app.state::<AppState>().engine.shutdown();
+                }
             }
         });
 }
