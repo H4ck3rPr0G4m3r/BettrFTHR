@@ -527,6 +527,9 @@ fn main() -> Result<()> {
         "audio_tracks": audio.as_ref().map(|a| a.shared.tracks.iter().map(|t| t.name.clone()).collect::<Vec<_>>()),
     }));
 
+    // Before the reader thread starts: on a pipe, this check blocks while another thread
+    // has a read pending on stdin, which would hold up the loop below until a command arrives.
+    let human = std::io::stdin().is_terminal();
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<Command>();
     {
         let tx = cmd_tx.clone();
@@ -564,7 +567,6 @@ fn main() -> Result<()> {
     let mut restarts = 0u32;
     let mut recorder: Option<recording::Recorder> = None;
     let mut game: Option<String> = None;
-    let human = std::io::stdin().is_terminal();
     if human {
         eprintln!(
             "bettr-engine running. {} saves a clip, {} toggles recording. Type `help` for commands.",
@@ -662,6 +664,7 @@ fn main() -> Result<()> {
         if stalled {
             tracing::error!(encoded, captured, "video encoder stalled");
         }
+        video.recover_blank_capture();
         if video.failed() || video.source_changed() || stalled {
             restarts += 1;
             tracing::warn!(restarts, "video pipeline needs a restart");
