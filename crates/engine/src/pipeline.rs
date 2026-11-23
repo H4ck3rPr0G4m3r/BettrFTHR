@@ -2,7 +2,7 @@
 //! encoder → replay ring. Timestamps are absolute QPC time (hns), so audio captured on the
 //! same clock lines up without any offset bookkeeping.
 
-use crate::capture::{LatestFrame, MonitorCapture};
+use crate::capture::{BlankProbe, LatestFrame, MonitorCapture};
 use crate::clock::{self, HNS_PER_SEC};
 use crate::convert::{Converter, output_size};
 use crate::d3d::{self, Gpu, Sendable};
@@ -11,9 +11,10 @@ use crate::ring::{Packet, PacketRing};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext;
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::Threading::{
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, INFINITE, SetWaitableTimer, TIMER_ALL_ACCESS,
@@ -22,6 +23,10 @@ use windows::Win32::System::Threading::{
 
 const NV12_POOL: usize = 8;
 const MAX_REPLAY_BYTES: usize = 1536 << 20;
+/// A capture that has been completely black this long gets a fresh WGC session.
+const BLANK_REOPEN_AFTER_HNS: i64 = 3 * HNS_PER_SEC;
+/// Longest wait between reopen attempts while the screen stays black (e.g. it really is).
+const BLANK_REOPEN_MAX_BACKOFF_HNS: i64 = 60 * HNS_PER_SEC;
 
 #[derive(Clone, Debug)]
 pub struct VideoConfig {
@@ -47,6 +52,8 @@ pub struct Shared {
     pub params: Mutex<Option<(Vec<u8>, Vec<u8>)>>,
     pub stats: Stats,
     pub failed: AtomicBool,
+    /// QPC time (hns) since which every sampled frame was blank; 0 while the picture is fine.
+    pub blank_since: AtomicI64,
 }
 
 pub struct VideoSnapshot {
@@ -69,6 +76,8 @@ pub struct VideoPipeline {
     ticker: Option<JoinHandle<()>>,
     encoder: Option<VideoEncoder>,
     capture: Option<MonitorCapture>,
+    blank_reopens: u32,
+    last_reopen_hns: i64,
 }
 
 impl VideoPipeline {
@@ -99,6 +108,7 @@ impl VideoPipeline {
             params: Mutex::new(None),
             stats: Stats::default(),
             failed: AtomicBool::new(false),
+            blank_since: AtomicI64::new(0),
         });
 
         // Bounded so a stalled encoder drops frames instead of overwriting textures it still reads.
@@ -145,9 +155,15 @@ impl VideoPipeline {
             let shared = shared.clone();
             let latest = capture.latest.clone();
             let converter = Sendable(converter);
+            let probe = Sendable((
+                BlankProbe::new(&gpu, capture.width, capture.height)?,
+                gpu.context.clone(),
+            ));
             std::thread::Builder::new().name("video-ticker".into()).spawn(move || {
                 let converter = converter;
-                if let Err(e) = run_ticker(&stop, &shared, &latest, &converter.0, fps, tx) {
+                let mut probe = probe;
+                let (probe, ctx) = &mut probe.0;
+                if let Err(e) = run_ticker(&stop, &shared, &latest, &converter.0, probe, ctx, fps, tx) {
                     tracing::error!("video ticker failed: {e:#}");
                     shared.failed.store(true, Ordering::SeqCst);
                 }
@@ -166,6 +182,8 @@ impl VideoPipeline {
             ticker: Some(ticker),
             encoder: Some(encoder),
             capture: Some(capture),
+            blank_reopens: 0,
+            last_reopen_hns: 0,
         })
     }
 
@@ -195,6 +213,34 @@ impl VideoPipeline {
             .is_some_and(|c| c.size_changed.load(Ordering::SeqCst))
     }
 
+    /// A WGC session can get stuck handing out black frames (only the cursor is drawn) and
+    /// never recover on its own. Swap in a fresh session once the picture has been black
+    /// for a few seconds, backing off while it stays black: the screen may really be black.
+    pub fn recover_blank_capture(&mut self) {
+        let since = self.shared.blank_since.load(Ordering::Relaxed);
+        if since == 0 {
+            self.blank_reopens = 0;
+            return;
+        }
+        let Some(capture) = self.capture.as_mut() else { return };
+        let now = clock::now_hns();
+        let wait = (BLANK_REOPEN_AFTER_HNS << self.blank_reopens.min(5)).min(BLANK_REOPEN_MAX_BACKOFF_HNS);
+        if now - since.max(self.last_reopen_hns) < wait {
+            return;
+        }
+        self.blank_reopens += 1;
+        self.last_reopen_hns = now;
+        tracing::warn!(
+            blank_secs = (now - since) / HNS_PER_SEC,
+            attempt = self.blank_reopens,
+            "capture is completely black; reopening the capture session"
+        );
+        if let Err(e) = capture.reopen(&self.gpu) {
+            tracing::error!("reopen capture session failed: {e:#}");
+            self.shared.failed.store(true, Ordering::SeqCst);
+        }
+    }
+
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(t) = self.ticker.take() {
@@ -213,11 +259,14 @@ impl Drop for VideoPipeline {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_ticker(
     stop: &AtomicBool,
     shared: &Shared,
     latest: &Mutex<Sendable<LatestFrame>>,
     converter: &Converter,
+    probe: &mut BlankProbe,
+    ctx: &ID3D11DeviceContext,
     fps: u32,
     tx: crossbeam_channel::Sender<EncodeJob>,
 ) -> Result<()> {
@@ -248,6 +297,20 @@ fn run_ticker(
             }
             shared.stats.captured.store(l.0.frames, Ordering::Relaxed);
             converter.convert(slot)?;
+            // Once a second: check the previous sample, queue the next.
+            if k % fps == 0 {
+                match probe.poll(ctx) {
+                    Some(true) => {
+                        let _ =
+                            shared
+                                .blank_since
+                                .compare_exchange(0, frame_time(k), Ordering::Relaxed, Ordering::Relaxed);
+                    }
+                    Some(false) => shared.blank_since.store(0, Ordering::Relaxed),
+                    None => {}
+                }
+                probe.sample(ctx, &l.0.tex);
+            }
         }
         let pts = frame_time(k);
         let job = EncodeJob {
