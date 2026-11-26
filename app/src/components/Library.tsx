@@ -272,6 +272,9 @@ const ClipCard = memo(function ClipCard({
               src={fileUrl(clip.thumb)}
               alt=""
               draggable={false}
+              // Large libraries: only cards near the viewport load and decode, off the main thread.
+              loading="lazy"
+              decoding="async"
               className={cx(
                 "absolute inset-0 size-full object-cover transition-[transform,opacity] duration-500 ease-out",
                 !selecting && "group-hover:scale-[1.03]",
