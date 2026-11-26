@@ -1,6 +1,9 @@
-//! Windows.Graphics.Capture source. Each arriving frame is copied (GPU→GPU) into a single
-//! "latest frame" texture and released immediately, so the WGC pool never starves; the
-//! constant-rate ticker reads from that texture.
+//! Windows.Graphics.Capture source. The newest arriving frame is parked in [`LatestFrame`]
+//! (replacing, and so releasing, the one before it); the constant-rate ticker copies it
+//! (GPU→GPU) into a single "latest frame" texture and releases it. Frames the ticker never
+//! sees cost nothing, so a 144-360 Hz monitor costs no more copies than one at the
+//! recording rate, and a static screen none at all. At most one frame is held, so the WGC
+//! pool never starves.
 //!
 //! A WGC monitor session can silently go blank: frames keep arriving (the cursor is still
 //! drawn into them) but every other pixel is zero, and it stays that way until the session
@@ -15,7 +18,9 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Foundation::TypedEventHandler;
-use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
+use windows::Graphics::Capture::{
+    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
@@ -38,6 +43,41 @@ pub struct LatestFrame {
     /// Number of frames received so far (0 = nothing captured yet).
     pub frames: u64,
     pub last_frame_hns: i64,
+    /// The newest frame not yet copied into `tex`, with the size of the region to copy.
+    pending: Option<(Direct3D11CaptureFrame, u32, u32)>,
+}
+
+impl LatestFrame {
+    /// Copies the newest captured frame into `tex` and hands it back to the pool. False when
+    /// nothing new arrived since the last call: `tex` already holds the newest picture.
+    pub fn update(&mut self, ctx: &ID3D11DeviceContext) -> bool {
+        let Some((frame, w, h)) = self.pending.take() else {
+            return false;
+        };
+        let src = frame
+            .Surface()
+            .and_then(|s| s.cast::<IDirect3DDxgiInterfaceAccess>())
+            .and_then(|a| unsafe { a.GetInterface::<ID3D11Texture2D>() });
+        let src = match src {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!("capture frame without a texture: {e}");
+                return false;
+            }
+        };
+        let region = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: w,
+            bottom: h,
+            back: 1,
+        };
+        // Queued on our device; releasing the frame right after is what the callback
+        // always did after its own copy.
+        unsafe { ctx.CopySubresourceRegion(&self.tex, 0, 0, 0, 0, &src, 0, Some(&region)) };
+        true
+    }
 }
 
 pub type Latest = Arc<Mutex<Sendable<LatestFrame>>>;
@@ -100,6 +140,7 @@ impl MonitorCapture {
             height,
             frames: 0,
             last_frame_hns: 0,
+            pending: None,
         })));
         let size_changed = Arc::new(AtomicBool::new(false));
         let session = open_session(gpu, &item, cursor, &latest, &size_changed)?;
@@ -118,7 +159,8 @@ impl MonitorCapture {
     /// Replace the WGC session with a fresh one that writes into the same texture. If the
     /// monitor's size changed meanwhile, flags `size_changed` so the pipeline is rebuilt.
     pub fn reopen(&mut self, gpu: &Gpu) -> Result<()> {
-        self.session = None; // close first: the old callback must stop writing
+        self.session = None; // close first: the old callback must stop delivering
+        self.latest.lock().0.pending = None;
         let item = monitor_item(self.monitor)?;
         let size = item.Size()?;
         if size.Width.max(2) as u32 != self.width || size.Height.max(2) as u32 != self.height {
@@ -126,6 +168,13 @@ impl MonitorCapture {
         }
         self.session = Some(open_session(gpu, &item, self.cursor, &self.latest, &self.size_changed)?);
         Ok(())
+    }
+}
+
+impl Drop for MonitorCapture {
+    fn drop(&mut self) {
+        // Hand the parked frame back before its pool closes.
+        self.latest.lock().0.pending = None;
     }
 }
 
@@ -146,7 +195,6 @@ fn open_session(
         size,
     )?;
 
-    let ctx = Sendable(gpu.context.clone());
     let device = Sendable(winrt_device.clone());
     let latest_cb = latest.clone();
     let changed_cb = size_changed.clone();
@@ -156,32 +204,20 @@ fn open_session(
             let pool = sender.ok()?;
             let frame = pool.TryGetNextFrame()?;
             let content = frame.ContentSize()?;
-            let surface = frame.Surface()?;
-            let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
-            let src: ID3D11Texture2D = unsafe { access.GetInterface()? };
             {
+                // Park it for the ticker; the frame it replaces (never copied) goes back to
+                // the pool right here.
                 let mut l = latest_cb.lock();
                 let w = (content.Width.max(0) as u32).min(l.0.width);
                 let h = (content.Height.max(0) as u32).min(l.0.height);
-                let region = D3D11_BOX {
-                    left: 0,
-                    top: 0,
-                    front: 0,
-                    right: w,
-                    bottom: h,
-                    back: 1,
-                };
-                unsafe {
-                    ctx.get()
-                        .CopySubresourceRegion(&l.0.tex, 0, 0, 0, 0, &src, 0, Some(&region))
-                };
+                l.0.pending = Some((frame, w, h));
                 l.0.frames += 1;
                 l.0.last_frame_hns = clock::now_hns();
             }
-            drop(frame);
             let mut ps = pool_size.lock();
             if content.Width != ps.Width || content.Height != ps.Height {
                 tracing::info!(w = content.Width, h = content.Height, "capture source size changed");
+                latest_cb.lock().0.pending = None; // a frame of the old size; the pipeline is rebuilt
                 *ps = SizeInt32 {
                     Width: content.Width,
                     Height: content.Height,

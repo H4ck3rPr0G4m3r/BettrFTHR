@@ -276,6 +276,10 @@ fn run_ticker(
     let frame_time = |k: i64| t0 + k * HNS_PER_SEC / fps;
     let mut k: i64 = -1;
     let mut slot = 0usize;
+    // Pool slot holding the newest converted picture. A tick with no new capture (static
+    // screen, game below the recording rate) re-sends it instead of converting the same
+    // picture again: identical frame for the encoder, no video-processor pass.
+    let mut newest: Option<usize> = None;
     while !stop.load(Ordering::Relaxed) {
         timer.sleep_until(frame_time(k + 1));
         let target = (clock::now_hns() - t0) * fps / HNS_PER_SEC;
@@ -290,13 +294,21 @@ fn run_ticker(
         }
         k = target;
         shared.stats.ticks.fetch_add(1, Ordering::Relaxed);
-        {
-            let l = latest.lock();
+        let src = {
+            let mut l = latest.lock();
             if l.0.frames == 0 {
                 continue; // nothing captured yet; don't encode black
             }
             shared.stats.captured.store(l.0.frames, Ordering::Relaxed);
-            converter.convert(slot)?;
+            let fresh = l.0.update(ctx);
+            let src = match newest {
+                Some(s) if !fresh => s,
+                _ => {
+                    converter.convert(slot)?;
+                    newest = Some(slot);
+                    slot
+                }
+            };
             // Once a second: check the previous sample, queue the next.
             if k % fps == 0 {
                 match probe.poll(ctx) {
@@ -311,15 +323,18 @@ fn run_ticker(
                 }
                 probe.sample(ctx, &l.0.tex);
             }
-        }
+            src
+        };
         let pts = frame_time(k);
         let job = EncodeJob {
-            texture: Sendable(converter.texture(slot).clone()),
+            texture: Sendable(converter.texture(src).clone()),
             pts,
             duration: frame_time(k + 1) - pts,
         };
         match tx.try_send(job) {
-            Ok(()) => slot = (slot + 1) % converter.pool_len(),
+            // A slot is rewritten only after the rest of the pool has been sent since.
+            Ok(()) if src == slot => slot = (slot + 1) % converter.pool_len(),
+            Ok(()) => {}
             Err(crossbeam_channel::TrySendError::Full(_)) => {
                 shared.stats.dropped.fetch_add(1, Ordering::Relaxed);
             }
