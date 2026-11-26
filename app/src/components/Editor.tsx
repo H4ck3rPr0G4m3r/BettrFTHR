@@ -157,16 +157,41 @@ export function Tracks({
 }) {
   const heads = useRef<(HTMLDivElement | null)[]>([]);
 
-  // Playhead across all lanes, updated without re-rendering React.
+  // Playhead across all lanes, updated without re-rendering React: every frame while the
+  // video plays, otherwise only when it moves (seek, scrub, frame step).
   useEffect(() => {
+    const v = video();
+    if (!v) return;
     let raf = 0;
+    const draw = () => {
+      for (const h of heads.current) if (h) h.style.left = pct(v.currentTime, probe.duration);
+    };
     const loop = () => {
-      const v = video();
-      if (v) for (const h of heads.current) if (h) h.style.left = pct(v.currentTime, probe.duration);
+      draw();
       raf = requestAnimationFrame(loop);
     };
-    raf = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(raf);
+    const play = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(loop);
+    };
+    const halt = () => {
+      cancelAnimationFrame(raf);
+      draw();
+    };
+    const moved = ["seeking", "seeked", "timeupdate", "durationchange"] as const;
+    if (v.paused) draw();
+    else play();
+    v.addEventListener("play", play);
+    v.addEventListener("pause", halt);
+    v.addEventListener("ended", halt);
+    for (const e of moved) v.addEventListener(e, draw);
+    return () => {
+      cancelAnimationFrame(raf);
+      v.removeEventListener("play", play);
+      v.removeEventListener("pause", halt);
+      v.removeEventListener("ended", halt);
+      for (const e of moved) v.removeEventListener(e, draw);
+    };
   }, [video, probe.duration]);
 
   const update = (i: number, patch: Partial<SourceState>) =>

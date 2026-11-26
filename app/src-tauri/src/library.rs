@@ -2,6 +2,8 @@
 //! of thumbnails and durations that the UI produces from the video itself.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -41,11 +43,20 @@ fn file_info(path: &Path) -> Option<(u64, u64)> {
     Some((m.len(), modified))
 }
 
+fn has_mp4_ext(p: &Path) -> bool {
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+}
+
 fn is_clip(p: &Path) -> bool {
-    p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+    has_mp4_ext(p) && p.is_file()
 }
 
 /// All clips under `root` (top level and one level of game folders), newest first.
+///
+/// Runs on every focus and save, so it touches each clip once: the directory listing says
+/// what is a file or folder, one listing of the cache says which thumbnails exist, and only
+/// size and mtime are read per clip (from the file itself: NTFS listings lag behind a file
+/// that is still being written, like a live recording).
 pub fn scan(root: &Path, cache: &Path) -> Vec<Clip> {
     let mut files: Vec<(PathBuf, Option<String>)> = Vec::new();
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -53,24 +64,37 @@ pub fn scan(root: &Path, cache: &Path) -> Vec<Clip> {
     };
     for e in entries.flatten() {
         let p = e.path();
-        if p.is_dir() {
+        if entry_is(&e, &p, std::fs::FileType::is_dir) {
             let game = p.file_name().map(|n| n.to_string_lossy().into_owned());
             if let Ok(sub) = std::fs::read_dir(&p) {
-                files.extend(sub.flatten().map(|e| e.path()).filter(|p| is_clip(p)).map(|p| (p, game.clone())));
+                files.extend(
+                    sub.flatten()
+                        .filter_map(|e| {
+                            let p = e.path();
+                            (has_mp4_ext(&p) && entry_is(&e, &p, std::fs::FileType::is_file)).then_some(p)
+                        })
+                        .map(|p| (p, game.clone())),
+                );
             }
-        } else if is_clip(&p) {
+        } else if has_mp4_ext(&p) && entry_is(&e, &p, std::fs::FileType::is_file) {
             files.push((p, None));
         }
     }
+    let cached: HashSet<OsString> = std::fs::read_dir(cache)
+        .map(|d| d.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
     let mut clips: Vec<Clip> = files
         .into_iter()
         .filter_map(|(path, game)| {
             let (bytes, modified) = file_info(&path)?;
             let title = path.file_stem()?.to_string_lossy().into_owned();
             let key = cache_key(&path, bytes, modified);
-            let thumb = cache.join(format!("{key}.jpg"));
-            let duration = std::fs::read(cache.join(format!("{key}.json")))
-                .ok()
+            let thumb_name = format!("{key}.jpg");
+            let meta_name = format!("{key}.json");
+            let duration = cached
+                .contains(OsStr::new(&meta_name))
+                .then(|| std::fs::read(cache.join(&meta_name)).ok())
+                .flatten()
                 .and_then(|b| serde_json::from_slice::<Meta>(&b).ok())
                 .map(|m| m.duration);
             Some(Clip {
@@ -80,13 +104,22 @@ pub fn scan(root: &Path, cache: &Path) -> Vec<Clip> {
                 bytes,
                 modified,
                 duration,
-                thumb: thumb.is_file().then_some(thumb),
+                thumb: cached.contains(OsStr::new(&thumb_name)).then(|| cache.join(thumb_name)),
                 path,
             })
         })
         .collect();
     clips.sort_by(|a, b| b.modified.cmp(&a.modified));
     clips
+}
+
+/// The entry's type from the directory listing itself (no extra file open), following a
+/// link the way `Path::is_file`/`is_dir` would.
+fn entry_is(e: &std::fs::DirEntry, p: &Path, is: fn(&std::fs::FileType) -> bool) -> bool {
+    match e.file_type() {
+        Ok(t) if !t.is_symlink() => is(&t),
+        _ => std::fs::metadata(p).is_ok_and(|m| is(&m.file_type())),
+    }
 }
 
 /// Stores a UI-rendered thumbnail (JPEG bytes) and the measured duration.

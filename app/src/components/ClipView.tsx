@@ -94,18 +94,23 @@ export function ClipView({ path, filter }: { path: string; filter: Filter }) {
     if (!editing || !edit) return;
     const v = player.current?.video();
     if (!v) return;
-    const onPlay = () => {
-      if (v.currentTime < edit.start - 0.05 || v.currentTime >= edit.end - 0.05) v.currentTime = edit.start;
-    };
+    // Watches every frame while playing only; a paused editor schedules nothing.
     let raf = 0;
     const loop = () => {
-      if (!v.paused && v.currentTime >= edit.end) {
+      if (v.paused) return; // the next "play" restarts it
+      if (v.currentTime >= edit.end) {
         v.pause();
         v.currentTime = edit.end;
+        return;
       }
       raf = requestAnimationFrame(loop);
     };
-    raf = requestAnimationFrame(loop);
+    const onPlay = () => {
+      if (v.currentTime < edit.start - 0.05 || v.currentTime >= edit.end - 0.05) v.currentTime = edit.start;
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(loop);
+    };
+    if (!v.paused) raf = requestAnimationFrame(loop);
     v.addEventListener("play", onPlay);
     return () => {
       cancelAnimationFrame(raf);
@@ -498,7 +503,14 @@ function Filmstrip({ clips, current, onPick }: { clips: Clip[]; current: string;
               )}
             >
               {c.thumb ? (
-                <img src={fileUrl(c.thumb)} alt="" draggable={false} className="absolute inset-0 size-full object-cover" />
+                <img
+                  src={fileUrl(c.thumb)}
+                  alt=""
+                  draggable={false}
+                  loading="lazy"
+                  decoding="async"
+                  className="absolute inset-0 size-full object-cover"
+                />
               ) : (
                 <div className="skeleton absolute inset-0" />
               )}
